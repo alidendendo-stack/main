@@ -26,12 +26,13 @@ from flask import Flask, Response, render_template_string, jsonify, request, sen
 # --- НАСТРОЙКИ СИСТЕМЫ ---
 CAMERA_INDEX_FILE = "camera_index.txt"
 COLLECTION_NAME = "parts_resnet50"
-BASE_DIR = "reference_images"
-QDRANT_DIR = "qdrant_storage"
-HOST_PORT = 5000
+BASE_PATH = os.path.dirname(os.path.abspath(__file__)) # Получаем путь к папке скрипта
+BASE_DIR = os.path.join(BASE_PATH, "reference_images")
+QDRANT_DIR = os.path.join(BASE_PATH, "qdrant_storage")
 
 os.makedirs(BASE_DIR, exist_ok=True)
 os.makedirs(QDRANT_DIR, exist_ok=True)
+HOST_PORT = 5000
 
 def load_camera_index():
     if os.path.exists(CAMERA_INDEX_FILE):
@@ -608,7 +609,7 @@ class IndustrialVisionApp:
             if self.cap and self.cap.isOpened():
                 self.cap.release()
             self.init_camera()
-            messagebox.SUCCESS if hasattr(messagebox, 'SUCCESS') else None
+            messagebox.showinfo("Успех", f"Камера переключена на индекс: {new_idx}")
             print(f"✅ Камера переключена на индекс: {new_idx}")
         except Exception as e:
             print(f"Ошибка переключения камеры: {e}")

@@ -21,7 +21,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller
+        pip install pyinstaller opencv-python
         # Если у вас есть другие библиотеки (например, pandas, opencv-python и т.д.), 
         # добавьте их сюда через пробел, например: pip install pyinstaller pandas opencv-python
 

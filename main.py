@@ -1,3 +1,8 @@
+import sys
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 import os
 import cv2
 import torch

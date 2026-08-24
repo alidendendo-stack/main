@@ -1,6 +1,5 @@
 name: Build Windows EXE
 
-
 on:
   push:
     branches: [ main, master ]
@@ -11,25 +10,46 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller opencv-python torch torchvision qdrant-client flask pillow
-      
-    - name: Build with PyInstaller
-      run: |
-        pyinstaller --onefile --noconsole main.py
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-exe
-        path: dist/*.exe
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller
+          pip install opencv-python
+          pip install torch torchvision
+          pip install qdrant-client
+          pip install flask
+          pip install pillow
+
+      - name: Check OpenCV
+        run: |
+          python -c "import cv2; print('OpenCV:', cv2.__version__)"
+          python -c "import cv2; print('Camera backends:', cv2.videoio_registry.getCameraBackends())"
+
+      - name: Build EXE
+        run: |
+          pyinstaller ^
+            --onefile ^
+            --noconsole ^
+            --clean ^
+            --name IndustrialVision ^
+            --collect-all cv2 ^
+            --collect-all qdrant_client ^
+            --collect-all PIL ^
+            main.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/IndustrialVision.exe

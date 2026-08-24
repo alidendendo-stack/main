@@ -42,7 +42,7 @@ jobs:
       - name: Build EXE
         shell: pwsh
         run: |
-          pyinstaller --onefile --noconsole --clean --name IndustrialVision --collect-all cv2 --collect-all qdrant_client --collect-all PIL main.py
+          pyinstaller --onefile --noconsole --clean --name IndustrialVision --collect-all cv2 --collect-binaries cv2 --hidden-import cv2 --collect-all qdrant_client --collect-all PIL --collect-all torchvision main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

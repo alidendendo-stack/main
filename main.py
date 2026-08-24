@@ -181,35 +181,83 @@ class IndustrialVisionApp:
         if self.cap and self.cap.isOpened():
             self.update_frame()
 
-    def init_camera(self):
-        global CAMERA_INDEX
-        CAMERA_INDEX = load_camera_index()
-        
-        self.cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-        
-        if not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(CAMERA_INDEX)
-            
-        if not self.cap.isOpened():
-            for idx in [0, 1, 2, 3]:
-                if idx != CAMERA_INDEX:
-                    self.cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                    if not self.cap.isOpened():
-                        self.cap = cv2.VideoCapture(idx)
-                    if self.cap.isOpened():
-                        break
-        
-        if self.cap.isOpened():
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    def open_camera(self, idx):
+        """Надежное открытие камеры для EXE (DSHOW -> ANY + проверка read())."""
+        backends = [
+            ("DSHOW", cv2.CAP_DSHOW),
+            ("ANY", cv2.CAP_ANY),
+        ]
+
+        for backend_name, backend in backends:
+            cap = None
             try:
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            except:
-                pass
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-        else:
-            print("❌ Ошибка: Камера не найдена ни на одном из индексов!")
+                print(f"Пробуем камеру {idx} через {backend_name}")
+
+                cap = cv2.VideoCapture(idx, backend)
+
+                if not cap.isOpened():
+                    continue
+
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    cap.release()
+                    continue
+
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                try:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                except:
+                    pass
+
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+
+                print(f"Успешно открыта камера {idx} ({backend_name})")
+                return cap
+
+            except Exception as e:
+                print(f"Ошибка открытия камеры {idx} ({backend_name}): {e}")
+                try:
+                    if cap:
+                        cap.release()
+                except:
+                    pass
+
+        return None
+
+    def init_camera(self):
+        """Автоматическое определение камеры с перебором индексов."""
+        global CAMERA_INDEX
+
+        CAMERA_INDEX = load_camera_index()
+
+        try:
+            if hasattr(self, "cap") and self.cap and self.cap.isOpened():
+                self.cap.release()
+        except:
+            pass
+
+        self.cap = None
+
+        indexes = [CAMERA_INDEX]
+        for i in [0, 1, 2, 3]:
+            if i not in indexes:
+                indexes.append(i)
+
+        print(f"Поиск камеры. Приоритетный индекс: {CAMERA_INDEX}")
+
+        for idx in indexes:
+            cap = self.open_camera(idx)
+            if cap is not None:
+                self.cap = cap
+                CAMERA_INDEX = idx
+                save_camera_index(idx)
+                print(f"Используется камера #{idx}")
+                return
+
+        print("Камера не найдена ни на одном индексе (0-3)")
+        self.cap = None
 
     def process_ui_queue(self):
         try:

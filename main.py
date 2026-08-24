@@ -148,6 +148,8 @@ class IndustrialVisionApp:
         self.camera_scan_lock = threading.Lock()
         self.camera_scan_in_progress = False
         self.camera_retry_after = 0
+        self.camera_frame_failures = 0
+        self.camera_reconnect_scheduled = False
         self.available_cameras = []
         self.camera_error = "Камера еще не проверялась"
 
@@ -304,13 +306,28 @@ class IndustrialVisionApp:
         return None
 
     def scan_available_cameras(self):
-        """Полный поиск камер 0..9. Возвращает только реально читающие кадр устройства."""
+        """Поиск камер без повторного открытия уже работающего устройства.
+
+        Важно: на Windows второй VideoCapture того же индекса может оборвать
+        первый поток DirectShow. Поэтому активная камера добавляется в результат
+        и исключается из проверки.
+        """
         found = []
         preferred = load_camera_index()
         indexes = [preferred] + [i for i in range(10) if i != preferred]
+        active_index = None
+        with self.camera_lock:
+            if self.cap is not None and self.cap.isOpened():
+                active_index = CAMERA_INDEX
+
         camera_log(f"=== НАЧАЛО ПОИСКА КАМЕР. Приоритет #{preferred} ===")
+        if active_index is not None:
+            found.append(active_index)
+            camera_log(f"Камера #{active_index} уже подключена — повторно не открываем")
 
         for idx in indexes:
+            if idx == active_index:
+                continue
             cap = self.open_camera(idx)
             if cap is not None:
                 found.append(idx)
@@ -324,9 +341,10 @@ class IndustrialVisionApp:
 
     def start_camera_scan(self):
         """Запускает поиск камеры в отдельном потоке."""
-        if self.camera_scan_in_progress:
-            return
-        self.camera_scan_in_progress = True
+        with self.camera_scan_lock:
+            if self.camera_scan_in_progress:
+                return
+            self.camera_scan_in_progress = True
         self.set_camera_status("🔎 Ищем доступные камеры...")
 
         def worker():
@@ -378,8 +396,12 @@ class IndustrialVisionApp:
 
         preferred = load_camera_index()
         selected = preferred if preferred in found else found[0]
-        self.switch_camera(selected, show_message=False)
-        self.set_camera_status(f"✅ Камера #{selected} подключена. Доступные: {', '.join(map(str, found))}")
+        if self.switch_camera(selected, show_message=False):
+            self.set_camera_status(
+                f"✅ Камера #{selected} подключена. Доступные: {', '.join(map(str, found))}"
+            )
+        else:
+            self.set_camera_status(f"❌ Не удалось подключить камеру #{selected}")
 
     def switch_camera(self, idx, show_message=True):
         """Безопасно переключает рабочую камеру."""
@@ -391,6 +413,29 @@ class IndustrialVisionApp:
 
         self.set_camera_status(f"🔄 Подключение камеры #{idx}...")
         camera_log(f"Переключение на камеру #{idx}")
+
+        # Не открываем один и тот же DirectShow-источник второй раз.
+        with self.camera_lock:
+            current = self.cap
+            already_active = bool(current and current.isOpened() and CAMERA_INDEX == idx)
+        if already_active:
+            self.camera_frame_failures = 0
+            self.set_camera_status(f"✅ Камера #{idx} уже подключена")
+            camera_log(f"Камера #{idx} уже была активна; повторное открытие пропущено")
+            return True
+
+        # При смене устройства сначала освобождаем старое. Иначе драйверы
+        # некоторых USB-камер не дают открыть новый поток.
+        with self.camera_lock:
+            old = self.cap
+            self.cap = None
+        try:
+            if old:
+                old.release()
+        except Exception:
+            pass
+        if old:
+            time.sleep(0.25)
 
         cap = self.open_camera(idx)
         if cap is None:
@@ -405,17 +450,11 @@ class IndustrialVisionApp:
             return False
 
         with self.camera_lock:
-            old = self.cap
             self.cap = cap
             CAMERA_INDEX = idx
             save_camera_index(idx)
 
-        try:
-            if old and old is not cap:
-                old.release()
-        except Exception:
-            pass
-
+        self.camera_frame_failures = 0
         self.set_camera_status(f"✅ Камера #{idx} подключена")
         camera_log(f"Рабочая камера: #{idx}")
         if show_message:
@@ -1026,7 +1065,19 @@ class IndustrialVisionApp:
             camera_log(f"Исключение cap.read(): {repr(e)}")
 
         if not ret or frame is None or frame.size == 0:
-            camera_log(f"Камера #{load_camera_index()} перестала отдавать кадры — переподключение")
+            # Один сбой read() нормален для USB/встроенных камер при смене
+            # экспозиции или при старте. Не рвём рабочее соединение сразу.
+            self.camera_frame_failures += 1
+            if self.camera_frame_failures < 10:
+                self.set_camera_status(
+                    f"⚠️ Нет кадра ({self.camera_frame_failures}/10), ожидаем..."
+                )
+                self.root.after(100, self.update_frame)
+                return
+
+            camera_log(
+                f"Камера #{load_camera_index()} не отдала 10 кадров подряд — переподключение"
+            )
             with self.camera_lock:
                 bad_cap = self.cap
                 self.cap = None
@@ -1039,6 +1090,7 @@ class IndustrialVisionApp:
             self.root.after(200, self.update_frame)
             return
 
+        self.camera_frame_failures = 0
         self.set_camera_status(f"🟢 Камера #{load_camera_index()} работает")
 
         frame = cv2.flip(frame, 1)

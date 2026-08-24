@@ -1,9 +1,10 @@
+import io
 import sys
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
-import io
+
 
 # Принудительно меняем кодировку вывода на UTF-8
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -31,7 +32,12 @@ from flask import Flask, Response, render_template_string, jsonify, request, sen
 # --- НАСТРОЙКИ СИСТЕМЫ ---
 CAMERA_INDEX_FILE = "camera_index.txt"
 COLLECTION_NAME = "parts_resnet50"
-BASE_PATH = os.path.dirname(os.path.abspath(__file__)) # Получаем путь к папке скрипта
+if getattr(sys, 'frozen', False):
+    # Если запущено как .exe
+    BASE_PATH = os.path.dirname(sys.executable)
+else:
+    # Если запущено как обычный скрипт .py
+    BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.join(BASE_PATH, "reference_images")
 QDRANT_DIR = os.path.join(BASE_PATH, "qdrant_storage")
 
@@ -749,19 +755,29 @@ class IndustrialVisionApp:
             self.load_metadata_tab()
 
     # --- ОСНОВНОЙ ЦИКЛ КАМЕРЫ ---
-    def play_success_sound(self, text_to_speak):
+    import base64
+
+    def play_success_sound(text_to_speak):
         def _play():
             if not self.audio_lock.acquire(blocking=False): return
             try:
-                ps_command = (
-                    "[System.Console]::Beep(1200, 100); Start-Sleep -Milliseconds 50; [System.Console]::Beep(1600, 150); "
-                    f"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{text_to_speak}')"
-                )
-                subprocess.run(["powershell.exe", "-WindowStyle", "Hidden", "-Command", ps_command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except: pass
-            finally: self.audio_lock.release()
-        threading.Thread(target=_play, daemon=True).start()
+                # Кодируем текст в UTF-16LE и затем в Base64 для безопасной передачи в PowerShell
+                bytes_str = text_to_speak.encode('utf-16le')
+                b64_str = base64.b64encode(bytes_str).decode('utf-8')
 
+                ps_command = (
+                    "$enc = [System.Text.Encoding]::Unicode; "
+                    f"$str = $enc.GetString([System.Convert]::FromBase64String('{b64_str}')); "
+                    "Add-Type -AssemblyName System.Speech; "
+                    "(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak($str)"
+                )
+                subprocess.run(["powershell.exe", "-WindowStyle", "Hidden", "-EncodedCommand", 
+                                base64.b64encode(ps_command.encode('utf-16le')).decode('utf-8')], 
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except: pass
+        finally: self.audio_lock.release()
+    threading.Thread(target=_play, daemon=True).start()
+   
     def update_frame(self):
         global latest_frame, latest_crop, latest_raw_crop, scan_results
         

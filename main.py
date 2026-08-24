@@ -53,6 +53,21 @@ QDRANT_DIR = os.path.join(BASE_PATH, "qdrant_storage")
 os.makedirs(BASE_DIR, exist_ok=True)
 os.makedirs(QDRANT_DIR, exist_ok=True)
 HOST_PORT = 5000
+CAMERA_LOG_FILE = os.path.join(BASE_PATH, "camera_debug.log")
+
+def camera_log(message):
+    """Пишем диагностику камеры в файл, потому что EXE запускается с --noconsole."""
+    text = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    try:
+        with open(CAMERA_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        pass
+    try:
+        print(text)
+    except Exception:
+        pass
+
 
 def load_camera_index():
     if os.path.exists(CAMERA_INDEX_FILE):
@@ -128,7 +143,13 @@ class IndustrialVisionApp:
         self.ui_queue = queue.Queue()
         self.process_ui_queue()
 
-        self.init_camera()
+        self.cap = None
+        self.camera_lock = threading.RLock()
+        self.camera_scan_lock = threading.Lock()
+        self.camera_scan_in_progress = False
+        self.camera_retry_after = 0
+        self.available_cameras = []
+        self.camera_error = "Камера еще не проверялась"
 
         self.frame_counter = 0
         self.scan_line_y = 0
@@ -178,86 +199,232 @@ class IndustrialVisionApp:
         
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
 
-        if self.cap and self.cap.isOpened():
-            self.update_frame()
+        # Камеру ищем ПОСЛЕ создания интерфейса, чтобы EXE не зависал на старте.
+        self.root.after(100, self.start_camera_scan)
+        self.root.after(100, self.update_frame)
+
+    # =================================================================
+    # КАМЕРА — НОВАЯ ЛОГИКА
+    # =================================================================
+    def set_camera_status(self, text):
+        """Обновляет статус камеры в GUI, если элементы уже созданы."""
+        self.camera_error = text
+        try:
+            if hasattr(self, "camera_status_label"):
+                self.camera_status_label.config(text=text)
+        except Exception:
+            pass
+
+    def open_windows_camera_settings(self):
+        """Открывает системное разрешение камеры Windows."""
+        try:
+            if os.name == "nt":
+                os.startfile("ms-settings:privacy-webcam")
+                camera_log("Открыты настройки Windows: ms-settings:privacy-webcam")
+                return True
+        except Exception as e:
+            camera_log(f"Не удалось открыть настройки приватности камеры: {e}")
+        return False
 
     def open_camera(self, idx):
-        """Надежное открытие камеры для EXE (DSHOW -> ANY + проверка read())."""
-        backends = [
-            ("DSHOW", cv2.CAP_DSHOW),
-            ("ANY", cv2.CAP_ANY),
-        ]
+        """
+        Проверяет одну физическую камеру через несколько Windows backend'ов.
+        Не фиксируем MJPG до успешного кадра — это часто ломает камеры в EXE.
+        """
+        backends = []
+        if os.name == "nt":
+            backends = [
+                ("DSHOW", getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)),
+                ("MSMF", getattr(cv2, "CAP_MSMF", cv2.CAP_ANY)),
+                ("ANY", cv2.CAP_ANY),
+            ]
+        else:
+            backends = [("ANY", cv2.CAP_ANY)]
+
+        resolutions = [(640, 480), (1280, 720)]
 
         for backend_name, backend in backends:
             cap = None
             try:
-                print(f"Пробуем камеру {idx} через {backend_name}")
-
+                camera_log(f"Проверка камеры #{idx} через {backend_name}")
                 cap = cv2.VideoCapture(idx, backend)
 
-                if not cap.isOpened():
+                if not cap or not cap.isOpened():
+                    camera_log(f"Камера #{idx} / {backend_name}: open() = FALSE")
+                    if cap:
+                        cap.release()
                     continue
 
-                ret, frame = cap.read()
-                if not ret or frame is None:
+                # Сначала пробуем стандартный режим. Некоторые драйверы
+                # начинают отдавать кадры только после нескольких read().
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                good_frame = None
+                for width, height in resolutions:
+                    try:
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                    except Exception:
+                        pass
+
+                    for _ in range(8):
+                        ret, frame = cap.read()
+                        if ret and frame is not None and frame.size > 0:
+                            good_frame = frame
+                            break
+                        time.sleep(0.08)
+
+                    if good_frame is not None:
+                        break
+
+                if good_frame is None:
+                    camera_log(f"Камера #{idx} / {backend_name}: open() есть, но read() не дает кадр")
                     cap.release()
                     continue
 
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                # Не навязываем FOURCC/MJPG: драйвер камеры сам выбирает рабочий формат.
+
                 try:
-                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                except:
+                    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+                except Exception:
                     pass
 
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-
-                print(f"Успешно открыта камера {idx} ({backend_name})")
+                h, w = good_frame.shape[:2]
+                camera_log(f"КАМЕРА НАЙДЕНА: index={idx}, backend={backend_name}, size={w}x{h}")
                 return cap
 
             except Exception as e:
-                print(f"Ошибка открытия камеры {idx} ({backend_name}): {e}")
+                camera_log(f"Ошибка камеры #{idx} / {backend_name}: {repr(e)}")
                 try:
                     if cap:
                         cap.release()
-                except:
+                except Exception:
                     pass
 
         return None
 
-    def init_camera(self):
-        """Автоматическое определение камеры с перебором индексов."""
-        global CAMERA_INDEX
-
-        CAMERA_INDEX = load_camera_index()
-
-        try:
-            if hasattr(self, "cap") and self.cap and self.cap.isOpened():
-                self.cap.release()
-        except:
-            pass
-
-        self.cap = None
-
-        indexes = [CAMERA_INDEX]
-        for i in [0, 1, 2, 3]:
-            if i not in indexes:
-                indexes.append(i)
-
-        print(f"Поиск камеры. Приоритетный индекс: {CAMERA_INDEX}")
+    def scan_available_cameras(self):
+        """Полный поиск камер 0..9. Возвращает только реально читающие кадр устройства."""
+        found = []
+        preferred = load_camera_index()
+        indexes = [preferred] + [i for i in range(10) if i != preferred]
+        camera_log(f"=== НАЧАЛО ПОИСКА КАМЕР. Приоритет #{preferred} ===")
 
         for idx in indexes:
             cap = self.open_camera(idx)
             if cap is not None:
-                self.cap = cap
-                CAMERA_INDEX = idx
-                save_camera_index(idx)
-                print(f"Используется камера #{idx}")
-                return
+                found.append(idx)
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
-        print("Камера не найдена ни на одном индексе (0-3)")
-        self.cap = None
+        camera_log(f"=== ПОИСК ЗАВЕРШЕН. Найдены камеры: {found} ===")
+        return found
+
+    def start_camera_scan(self):
+        """Запускает поиск камеры в отдельном потоке."""
+        if self.camera_scan_in_progress:
+            return
+        self.camera_scan_in_progress = True
+        self.set_camera_status("🔎 Ищем доступные камеры...")
+
+        def worker():
+            try:
+                found = self.scan_available_cameras()
+                self.ui_queue.put(lambda: self.finish_camera_scan(found))
+            except Exception as e:
+                camera_log(f"Критическая ошибка поиска камер: {repr(e)}")
+                self.ui_queue.put(lambda: self.finish_camera_scan([]))
+
+        threading.Thread(target=worker, daemon=True, name="CameraScanner").start()
+
+    def finish_camera_scan(self, found):
+        self.camera_scan_in_progress = False
+        self.available_cameras = found
+
+        # Обновляем список в настройках.
+        try:
+            if hasattr(self, "cb_camera_idx"):
+                values = [str(x) for x in found] if found else ["0"]
+                self.cb_camera_idx["values"] = values
+                if str(load_camera_index()) in values:
+                    self.cb_camera_idx.set(str(load_camera_index()))
+                else:
+                    self.cb_camera_idx.set(values[0])
+        except Exception:
+            pass
+
+        if not found:
+            self.cap = None
+            self.set_camera_status("❌ Камера не найдена. Проверьте разрешение Windows и USB.")
+            camera_log("Камера не найдена. Открываем настройки приватности Windows.")
+            try:
+                self.open_windows_camera_settings()
+                messagebox.showwarning(
+                    "Камера не найдена",
+                    "Программа не получила кадр ни с одной камеры.\n\n"
+                    "Откройте настройки Windows и включите:\n"
+                    "• Доступ к камере\n"
+                    "• Разрешить приложениям доступ к камере\n"
+                    "• Разрешить классическим приложениям доступ к камере\n\n"
+                    "После этого нажмите «Повторить поиск камеры».\n\n"
+                    "Подробный лог: camera_debug.log"
+                )
+            except Exception:
+                pass
+            self.root.after(3000, self.start_camera_scan)
+            return
+
+        preferred = load_camera_index()
+        selected = preferred if preferred in found else found[0]
+        self.switch_camera(selected, show_message=False)
+        self.set_camera_status(f"✅ Камера #{selected} подключена. Доступные: {', '.join(map(str, found))}")
+
+    def switch_camera(self, idx, show_message=True):
+        """Безопасно переключает рабочую камеру."""
+        global CAMERA_INDEX
+        try:
+            idx = int(idx)
+        except Exception:
+            return False
+
+        self.set_camera_status(f"🔄 Подключение камеры #{idx}...")
+        camera_log(f"Переключение на камеру #{idx}")
+
+        cap = self.open_camera(idx)
+        if cap is None:
+            self.set_camera_status(f"❌ Камера #{idx} не дает кадр")
+            if show_message:
+                messagebox.showerror(
+                    "Ошибка камеры",
+                    f"Камера #{idx} открывается, но не отдает изображение.\n\n"
+                    "Проверьте разрешения Windows или выберите другую камеру.\n\n"
+                    "Смотрите camera_debug.log."
+                )
+            return False
+
+        with self.camera_lock:
+            old = self.cap
+            self.cap = cap
+            CAMERA_INDEX = idx
+            save_camera_index(idx)
+
+        try:
+            if old and old is not cap:
+                old.release()
+        except Exception:
+            pass
+
+        self.set_camera_status(f"✅ Камера #{idx} подключена")
+        camera_log(f"Рабочая камера: #{idx}")
+        if show_message:
+            messagebox.showinfo("Камера", f"Камера #{idx} успешно подключена.")
+        return True
+
+    def init_camera(self):
+        """Совместимый алиас: запускает полный асинхронный поиск камер."""
+        self.start_camera_scan()
 
     def process_ui_queue(self):
         try:
@@ -619,11 +786,15 @@ class IndustrialVisionApp:
 
         cam_frame = tk.Frame(main_frame, bg="#374151", padx=15, pady=10)
         cam_frame.pack(fill=tk.X, pady=(0, 15))
-        tk.Label(cam_frame, text="📹 Выбор индекса камеры:", font=("Arial", 11, "bold"), bg="#374151", fg="white").pack(side=tk.LEFT, padx=10)
-        self.cb_camera_idx = ttk.Combobox(cam_frame, values=["0", "1", "2", "3"], font=("Arial", 11), width=5, state="readonly")
+        tk.Label(cam_frame, text="📹 Камера:", font=("Arial", 11, "bold"), bg="#374151", fg="white").pack(side=tk.LEFT, padx=10)
+        self.cb_camera_idx = ttk.Combobox(cam_frame, values=[str(load_camera_index())], font=("Arial", 11), width=8, state="readonly")
         self.cb_camera_idx.pack(side=tk.LEFT, padx=10)
         self.cb_camera_idx.set(str(load_camera_index()))
-        tk.Button(cam_frame, text="💾 Сохранить и перезапустить камеру", bg="#10B981", fg="white", font=("Arial", 10, "bold"), command=self.apply_camera_index).pack(side=tk.LEFT, padx=15)
+        tk.Button(cam_frame, text="🔎 Найти камеры", bg="#3B82F6", fg="white", font=("Arial", 10, "bold"), command=self.start_camera_scan).pack(side=tk.LEFT, padx=5)
+        tk.Button(cam_frame, text="🔌 Подключить", bg="#10B981", fg="white", font=("Arial", 10, "bold"), command=self.apply_camera_index).pack(side=tk.LEFT, padx=5)
+        tk.Button(cam_frame, text="🔐 Разрешения Windows", bg="#F59E0B", fg="white", font=("Arial", 10, "bold"), command=self.open_windows_camera_settings).pack(side=tk.LEFT, padx=5)
+        self.camera_status_label = tk.Label(cam_frame, text="Проверка...", font=("Arial", 10, "bold"), bg="#374151", fg="#D1D5DB")
+        self.camera_status_label.pack(side=tk.LEFT, padx=15)
 
         container = tk.Frame(main_frame, bg="#2b2b2b")
         container.pack(fill=tk.BOTH, expand=True)
@@ -674,14 +845,11 @@ class IndustrialVisionApp:
     def apply_camera_index(self):
         try:
             new_idx = int(self.cb_camera_idx.get())
-            save_camera_index(new_idx)
-            if self.cap and self.cap.isOpened():
-                self.cap.release()
-            self.init_camera()
-            messagebox.showinfo("Успех", f"Камера переключена на индекс: {new_idx}")
-            print(f"✅ Камера переключена на индекс: {new_idx}")
+            if self.switch_camera(new_idx, show_message=True):
+                self.cb_camera_idx.set(str(new_idx))
         except Exception as e:
-            print(f"Ошибка переключения камеры: {e}")
+            camera_log(f"Ошибка переключения камеры из GUI: {repr(e)}")
+            messagebox.showerror("Камера", str(e))
 
     def load_metadata_tab(self):
         types = load_list("types.txt", ["metiz", "bigdetail"])
@@ -834,55 +1002,87 @@ class IndustrialVisionApp:
    
     def update_frame(self):
         global latest_frame, latest_crop, latest_raw_crop, scan_results
-        
-        if not self.cap or not self.cap.isOpened():
+
+        cap = None
+        with self.camera_lock:
+            cap = self.cap
+
+        if not cap or not cap.isOpened():
+            # В старой версии при неудаче поиска здесь был вечный цикл без
+            # повторного подключения. Теперь камера автоматически переподключается.
+            self.set_camera_status("🔎 Камера не подключена — повторный поиск...")
+            if not self.camera_scan_in_progress:
+                now = time.time()
+                if now >= self.camera_retry_after:
+                    self.camera_retry_after = now + 3.0
+                    self.start_camera_scan()
             self.root.after(100, self.update_frame)
             return
 
-        ret, frame = self.cap.read()
-        if ret:
-            frame = cv2.flip(frame, 1)
-            h, w = frame.shape[:2]
-            zoom_level = 2.0
-            size = int(min(h, w) / zoom_level)
-            start_y, start_x = int(h/2 - size/2), int(w/2 - size/2)
-            start_y, start_x = max(0, start_y), max(0, start_x)
+        try:
+            ret, frame = cap.read()
+        except Exception as e:
+            ret, frame = False, None
+            camera_log(f"Исключение cap.read(): {repr(e)}")
 
-            crop = frame[start_y:start_y+size, start_x:start_x+size]
-            
+        if not ret or frame is None or frame.size == 0:
+            camera_log(f"Камера #{load_camera_index()} перестала отдавать кадры — переподключение")
+            with self.camera_lock:
+                bad_cap = self.cap
+                self.cap = None
+            try:
+                if bad_cap:
+                    bad_cap.release()
+            except Exception:
+                pass
+            self.set_camera_status("⚠️ Потерян видеопоток — переподключение...")
+            self.root.after(200, self.update_frame)
+            return
+
+        self.set_camera_status(f"🟢 Камера #{load_camera_index()} работает")
+
+        frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
+        zoom_level = 2.0
+        size = int(min(h, w) / zoom_level)
+        start_y, start_x = int(h/2 - size/2), int(w/2 - size/2)
+        start_y, start_x = max(0, start_y), max(0, start_x)
+
+        crop = frame[start_y:start_y+size, start_x:start_x+size]
+
+        with state_lock:
+            latest_raw_crop = crop.copy()
+            latest_crop = cv2.resize(crop, (400, 400), interpolation=cv2.INTER_AREA)
+
+        self.frame_counter += 1
+        if self.frame_counter % 10 == 0 and not self.is_inferencing:
+            self.is_inferencing = True
             with state_lock:
-                latest_raw_crop = crop.copy()
-                latest_crop = cv2.resize(crop, (400, 400), interpolation=cv2.INTER_AREA)
-            
-            self.frame_counter += 1
-            if self.frame_counter % 10 == 0 and not self.is_inferencing:
-                self.is_inferencing = True
-                with state_lock:
-                    crop_for_inf = latest_crop.copy()
-                threading.Thread(target=self.recognize_part_thread, args=(crop_for_inf,), daemon=True).start()
+                crop_for_inf = latest_crop.copy()
+            threading.Thread(target=self.recognize_part_thread, args=(crop_for_inf,), daemon=True).start()
 
-            tab_id = self.notebook.index(self.notebook.select())
-            crop_h, crop_w = crop.shape[:2]
-            
-            if tab_id == 0:
-                if not self.is_detected:
-                    self.scan_line_y += int(crop_h * 0.05) * self.scan_line_dir
-                    if self.scan_line_y >= crop_h or self.scan_line_y <= 0:
-                        self.scan_line_dir *= -1
-                        self.scan_line_y = max(0, min(self.scan_line_y, crop_h))
-                    cv2.line(crop, (0, self.scan_line_y), (crop_w, self.scan_line_y), (0, 255, 0), 3)
-                    cv2.drawMarker(crop, (crop_w//2, crop_h//2), (0, 165, 255), cv2.MARKER_CROSS, 40, 2)
-                else:
-                    cv2.rectangle(crop, (0, 0), (crop_w-1, crop_h-1), (0, 255, 0), 8)
+        tab_id = self.notebook.index(self.notebook.select())
+        crop_h, crop_w = crop.shape[:2]
+
+        if tab_id == 0:
+            if not self.is_detected:
+                self.scan_line_y += int(crop_h * 0.05) * self.scan_line_dir
+                if self.scan_line_y >= crop_h or self.scan_line_y <= 0:
+                    self.scan_line_dir *= -1
+                    self.scan_line_y = max(0, min(self.scan_line_y, crop_h))
+                cv2.line(crop, (0, self.scan_line_y), (crop_w, self.scan_line_y), (0, 255, 0), 3)
+                cv2.drawMarker(crop, (crop_w//2, crop_h//2), (0, 165, 255), cv2.MARKER_CROSS, 40, 2)
             else:
-                cv2.drawMarker(crop, (crop_w//2, crop_h//2), (255, 255, 255), cv2.MARKER_CROSS, 40, 2)
+                cv2.rectangle(crop, (0, 0), (crop_w-1, crop_h-1), (0, 255, 0), 8)
+        else:
+            cv2.drawMarker(crop, (crop_w//2, crop_h//2), (255, 255, 255), cv2.MARKER_CROSS, 40, 2)
 
-            ui_frame = cv2.resize(crop, (650, 650), interpolation=cv2.INTER_LINEAR)
-            with state_lock: 
-                latest_frame = ui_frame.copy()
-            
+        ui_frame = cv2.resize(crop, (650, 650), interpolation=cv2.INTER_LINEAR)
+        with state_lock:
+            latest_frame = ui_frame.copy()
+
+        try:
             img_tk = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(ui_frame, cv2.COLOR_BGR2RGB)))
-            
             if tab_id == 0:
                 self.video_label_scanner.imgtk = img_tk
                 self.video_label_scanner.configure(image=img_tk)
@@ -890,7 +1090,9 @@ class IndustrialVisionApp:
             elif tab_id == 1:
                 self.video_label_register.imgtk = img_tk
                 self.video_label_register.configure(image=img_tk)
-                
+        except Exception as e:
+            camera_log(f"Ошибка отображения кадра Tkinter: {repr(e)}")
+
         self.root.after(30, self.update_frame)
 
     def recognize_part_thread(self, image_crop):
@@ -996,8 +1198,14 @@ class IndustrialVisionApp:
             self.lbl_sim2_img.config(image=img_sim2); self.lbl_sim2_img.image = img_sim2
 
     def on_closing(self):
-        if self.cap and self.cap.isOpened(): 
-            self.cap.release()
+        try:
+            with self.camera_lock:
+                cap = self.cap
+                self.cap = None
+            if cap and cap.isOpened():
+                cap.release()
+        except Exception as e:
+            camera_log(f"Ошибка закрытия камеры: {repr(e)}")
         self.root.destroy()
 
 
@@ -1126,10 +1334,13 @@ HTML_TEMPLATE = """
         <div class="meta-grid" style="grid-template-columns: 1fr; max-width: 900px; margin-bottom: 20px;">
             <div class="meta-card">
                 <h3>📹 Выбор камеры</h3>
-                <div style="display: flex; gap: 10px; align-items: center;">
-                    <label style="margin:0;">Индекс камеры:</label>
-                    <select id="web_cam_idx" style="width: 100px;"><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select>
-                    <button class="btn-meta btn-meta-add" onclick="saveWebCamera()">Установить</button>
+                <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                    <label style="margin:0;">Доступные камеры:</label>
+                    <select id="web_cam_idx" style="width: 110px;"></select>
+                    <button class="btn-meta btn-meta-add" onclick="scanWebCameras()">🔎 Найти</button>
+                    <button class="btn-meta btn-meta-add" onclick="saveWebCamera()">🔌 Подключить</button>
+                    <button class="btn-meta" style="background:#F59E0B;" onclick="openCameraSettings()">🔐 Разрешения Windows</button>
+                    <span id="web_camera_status" style="font-weight:bold; color:#D1D5DB;">Проверка...</span>
                 </div>
             </div>
         </div>
@@ -1280,18 +1491,58 @@ HTML_TEMPLATE = """
             tSelect.value = selectedMetaType;
             loadMetaPartsWeb();
             
-            fetch('/api/get_camera').then(r => r.json()).then(d => {
-                document.getElementById('web_cam_idx').value = d.camera_index;
-            });
+            await refreshWebCameras();
+        }
+
+        async function refreshWebCameras() {
+            try {
+                const res = await fetch('/api/cameras');
+                const d = await res.json();
+                const select = document.getElementById('web_cam_idx');
+                const current = String(d.camera_index);
+                const values = (d.available && d.available.length) ? d.available.map(String) : [current];
+                select.innerHTML = '';
+                values.forEach(v => {
+                    const o = document.createElement('option');
+                    o.value = v; o.textContent = 'Камера #' + v;
+                    select.appendChild(o);
+                });
+                if(values.includes(current)) select.value = current;
+                document.getElementById('web_camera_status').textContent = d.active ? ('🟢 Подключена #' + current) : ('⚠️ ' + (d.error || 'Не подключена'));
+            } catch(e) {
+                document.getElementById('web_camera_status').textContent = '❌ Нет связи с приложением';
+            }
+        }
+
+        async function scanWebCameras() {
+            document.getElementById('web_camera_status').textContent = '🔎 Идет поиск...';
+            await fetch('/api/scan_cameras', {method:'POST'});
+            let attempts = 0;
+            const timer = setInterval(async () => {
+                await refreshWebCameras();
+                attempts++;
+                if(attempts >= 30) clearInterval(timer);
+            }, 1000);
+        }
+
+        async function openCameraSettings() {
+            await fetch('/api/open_camera_settings', {method:'POST'});
+            alert('Открыты настройки Windows. Включите доступ к камере для классических приложений.');
         }
 
         async function saveWebCamera() {
             const idx = document.getElementById('web_cam_idx').value;
-            await fetch('/api/set_camera', {
+            const res = await fetch('/api/set_camera', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({camera_index: parseInt(idx)})
             });
-            alert("Камера переключена!");
+            const data = await res.json();
+            if(data.status === 'success') {
+                alert('Камера #' + idx + ' подключена!');
+            } else {
+                alert('Не удалось подключить камеру #' + idx + '. Смотрите camera_debug.log');
+            }
+            await refreshWebCameras();
         }
 
         async function loadMetaPartsWeb() {
@@ -1394,14 +1645,47 @@ def get_parts_api():
 
 @app_flask.route("/api/get_camera")
 def get_camera_api():
-    return jsonify({"camera_index": load_camera_index()})
+    with state_lock:
+        active = bool(globals().get("latest_frame") is not None)
+    application = globals().get("app")
+    return jsonify({
+        "camera_index": load_camera_index(),
+        "available": getattr(application, "available_cameras", []) if application else [],
+        "active": active
+    })
+
+@app_flask.route("/api/cameras")
+def cameras_api():
+    """Возвращает последний результат поиска камер."""
+    return jsonify({
+        "available": getattr(app, "available_cameras", []),
+        "camera_index": load_camera_index(),
+        "active": bool(getattr(app, "cap", None) and app.cap.isOpened()) if "app" in globals() else False,
+        "error": getattr(app, "camera_error", "") if "app" in globals() else "Приложение еще запускается"
+    })
+
+@app_flask.route("/api/scan_cameras", methods=["POST"])
+def scan_cameras_api():
+    try:
+        app.start_camera_scan()
+        return jsonify({"status": "scanning"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app_flask.route("/api/set_camera", methods=["POST"])
 def set_camera_api():
-    data = request.json
-    idx = data.get("camera_index", 0)
-    save_camera_index(idx)
-    return jsonify({"status": "success"})
+    data = request.json or {}
+    idx = int(data.get("camera_index", 0))
+    ok = app.switch_camera(idx, show_message=False) if "app" in globals() else False
+    return jsonify({"status": "success" if ok else "error", "camera_index": idx})
+
+@app_flask.route("/api/open_camera_settings", methods=["POST"])
+def open_camera_settings_api():
+    try:
+        ok = app.open_windows_camera_settings() if "app" in globals() else False
+        return jsonify({"status": "success" if ok else "error"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app_flask.route("/api/meta/add", methods=["POST"])
 def meta_add_api():
@@ -1552,5 +1836,6 @@ if __name__ == "__main__":
 
     root = tk.Tk()
     app = IndustrialVisionApp(root)
+    globals()["app"] = app
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()

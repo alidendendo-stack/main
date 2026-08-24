@@ -9,6 +9,7 @@ import time
 import threading
 import subprocess
 import queue
+import codecs
 import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageTk, ImageDraw
@@ -34,17 +35,18 @@ else:
         sys.stderr = open(os.devnull, "w", encoding='utf-8')
     except:
         pass
-        
 
 # --- НАСТРОЙКИ СИСТЕМЫ ---
-CAMERA_INDEX_FILE = "camera_index.txt"
-COLLECTION_NAME = "parts_resnet50"
 if getattr(sys, 'frozen', False):
     # Если запущено как .exe
     BASE_PATH = os.path.dirname(sys.executable)
 else:
     # Если запущено как обычный скрипт .py
     BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+
+CAMERA_INDEX_FILE = os.path.join(BASE_PATH, "camera_index.txt")
+COLLECTION_NAME = "parts_resnet50"
+
 BASE_DIR = os.path.join(BASE_PATH, "reference_images")
 QDRANT_DIR = os.path.join(BASE_PATH, "qdrant_storage")
 
@@ -100,15 +102,17 @@ preprocess = ResNet50_Weights.DEFAULT.transforms()
 print("✅ ИИ и База данных успешно инициализированы!")
 
 def load_list(filename, default):
-    if not os.path.exists(filename):
-        with open(filename, "w", encoding="utf-8") as f:
+    filepath = os.path.join(BASE_PATH, filename)
+    if not os.path.exists(filepath):
+        with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(default))
         return default
-    with open(filename, "r", encoding="utf-8") as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
 
 def save_list(filename, data_list):
-    with open(filename, "w", encoding="utf-8") as f:
+    filepath = os.path.join(BASE_PATH, filename)
+    with open(filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(data_list))
 
 # =====================================================================
@@ -180,11 +184,18 @@ class IndustrialVisionApp:
     def init_camera(self):
         global CAMERA_INDEX
         CAMERA_INDEX = load_camera_index()
-        self.cap = cv2.VideoCapture(CAMERA_INDEX)
+        
+        self.cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+        
         if not self.cap.isOpened():
-            for idx in [0, 1, 2]:
+            self.cap = cv2.VideoCapture(CAMERA_INDEX)
+            
+        if not self.cap.isOpened():
+            for idx in [0, 1, 2, 3]:
                 if idx != CAMERA_INDEX:
-                    self.cap = cv2.VideoCapture(idx)
+                    self.cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                    if not self.cap.isOpened():
+                        self.cap = cv2.VideoCapture(idx)
                     if self.cap.isOpened():
                         break
         
@@ -198,7 +209,7 @@ class IndustrialVisionApp:
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
             self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
         else:
-            print("❌ Ошибка: Камера не найдена!")
+            print("❌ Ошибка: Камера не найдена ни на одном из индексов!")
 
     def process_ui_queue(self):
         try:

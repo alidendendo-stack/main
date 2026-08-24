@@ -1,14 +1,5 @@
 import io
 import sys
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
-
-
-# Принудительно меняем кодировку вывода на UTF-8
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 import os
 import cv2
 import torch
@@ -26,8 +17,16 @@ from qdrant_client.models import VectorParams, Distance, PointStruct, PointIdsLi
 from torchvision.models import resnet50, ResNet50_Weights
 
 # --- ИМПОРТЫ ДЛЯ FLASK ---
-import io
 from flask import Flask, Response, render_template_string, jsonify, request, send_from_directory
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+# Принудительно меняем кодировку вывода на UTF-8
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # --- НАСТРОЙКИ СИСТЕМЫ ---
 CAMERA_INDEX_FILE = "camera_index.txt"
@@ -80,7 +79,6 @@ scan_results = {
 
 # --- ИНИЦИАЛИЗАЦИЯ ИИ И ЛОКАЛЬНОГО QDRANT ---
 print("⚙️ Инициализация локального Qdrant и ResNet50...")
-# Локальный режим: база данных хранится прямо в папке с программой, сервер не нужен!
 client = QdrantClient(path=QDRANT_DIR)
 if not client.collection_exists(COLLECTION_NAME):
     client.create_collection(
@@ -115,14 +113,11 @@ class IndustrialVisionApp:
         self.root.geometry("1400x800")
         self.root.configure(bg="#2b2b2b")
 
-        # --- ИНИЦИАЛИЗАЦИЯ ОЧЕРЕДИ ДЛЯ ПОТОКОВ ---
         self.ui_queue = queue.Queue()
         self.process_ui_queue()
 
-        # Инициализация камеры (кроссплатформенная без привязки к V4L2)
         self.init_camera()
 
-        # Переменные логики
         self.frame_counter = 0
         self.scan_line_y = 0
         self.scan_line_dir = 1
@@ -142,7 +137,6 @@ class IndustrialVisionApp:
         self.last_spoken_name = None
         self.audio_lock = threading.Lock()
 
-        # Создание вкладок Tkinter
         style = ttk.Style()
         style.theme_use('default')
         style.configure("TNotebook", background="#2b2b2b", borderwidth=0)
@@ -220,7 +214,6 @@ class IndustrialVisionApp:
             return ImageTk.PhotoImage(img)
         return self.create_blank_image(size, "Нет файла")
 
-    # --- UI СКАНЕРА ---
     def setup_scanner_ui(self, parent):
         left_panel = tk.Frame(parent, width=350, bg="#E5E7EB", padx=20, pady=20)
         left_panel.pack(side=tk.LEFT, fill=tk.Y)
@@ -252,7 +245,6 @@ class IndustrialVisionApp:
         self.lbl_sim2_name = tk.Label(right_panel, text="---", font=("Arial", 11, "bold"), bg="#374151", fg="#9CA3AF")
         self.lbl_sim2_name.pack(pady=2)
 
-    # --- UI РЕГИСТРАЦИИ ---
     def setup_register_ui(self, parent):
         self.video_label_register = tk.Label(parent, bg="#2b2b2b")
         self.video_label_register.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -300,7 +292,11 @@ class IndustrialVisionApp:
             self.lbl_reg_status.config(text="❌ Заполните все поля!", fg="#EF4444")
             return
             
-        if latest_raw_crop is None:
+        with state_lock:
+            local_crop = latest_crop.copy() if latest_crop is not None else None
+            local_raw = latest_raw_crop.copy() if latest_raw_crop is not None else None
+
+        if local_raw is None or local_crop is None:
             self.lbl_reg_status.config(text="❌ Ошибка камеры!", fg="#EF4444")
             return
 
@@ -310,14 +306,14 @@ class IndustrialVisionApp:
         if part not in parts: save_list(f"parts_{v_type}.txt", parts + [part])
 
         try:
-            img_pil = Image.fromarray(cv2.cvtColor(latest_crop, cv2.COLOR_BGR2RGB))
+            img_pil = Image.fromarray(cv2.cvtColor(local_crop, cv2.COLOR_BGR2RGB))
             with torch.no_grad():
                 vector = resnet(preprocess(img_pil).unsqueeze(0))[0].detach().numpy().tolist()
 
             point_id = str(uuid.uuid4())
             save_dir = os.path.join(BASE_DIR, v_type, part)
             os.makedirs(save_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(save_dir, f"{point_id}.jpg"), latest_raw_crop)
+            cv2.imwrite(os.path.join(save_dir, f"{point_id}.jpg"), local_raw)
 
             with qdrant_lock:
                 client.upsert(
@@ -330,7 +326,6 @@ class IndustrialVisionApp:
         except Exception as e:
             self.lbl_reg_status.config(text=f"❌ Ошибка: {e}", fg="#EF4444")
 
-    # --- UI ГАЛЕРЕИ ---
     def setup_gallery_ui(self, parent):
         top_frame = tk.Frame(parent, bg="#F9FAFB", pady=15, padx=20)
         top_frame.pack(fill=tk.X)
@@ -549,14 +544,12 @@ class IndustrialVisionApp:
         
         render_photo()
 
-    # --- UI СПРАВОЧНИКОВ (types, parts + выбор камеры) ---
     def setup_metadata_ui(self, parent):
         main_frame = tk.Frame(parent, bg="#2b2b2b", padx=20, pady=20)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         tk.Label(main_frame, text="⚙️ Управление справочниками и настройками", font=("Arial", 16, "bold"), bg="#2b2b2b", fg="white").pack(pady=(0, 10))
 
-        # Панель выбора камеры
         cam_frame = tk.Frame(main_frame, bg="#374151", padx=15, pady=10)
         cam_frame.pack(fill=tk.X, pady=(0, 15))
         tk.Label(cam_frame, text="📹 Выбор индекса камеры:", font=("Arial", 11, "bold"), bg="#374151", fg="white").pack(side=tk.LEFT, padx=10)
@@ -574,7 +567,6 @@ class IndustrialVisionApp:
         font_label = ("Arial", 11, "bold")
         font_btn = ("Arial", 10, "bold")
 
-        # 1. Колонка: Типы сборки (Types)
         f_type = tk.LabelFrame(container, text=" Типы сборки (Types) ", font=font_label, bg="#374151", fg="white", padx=15, pady=15)
         f_type.grid(row=0, column=0, sticky="nsew", padx=10)
         
@@ -591,7 +583,6 @@ class IndustrialVisionApp:
         tk.Button(b_frame2, text="🗑️ Удалить", bg="#D32F2F", fg="white", font=font_btn, command=self.meta_delete_type).pack(side=tk.LEFT, expand=True, padx=2)
         self.lb_types.bind("<<ListboxSelect>>", lambda e: self.meta_select_item(self.lb_types, self.ent_type))
 
-        # 2. Колонка: Детали (Parts по типам)
         f_part = tk.LabelFrame(container, text=" Детали (Parts) ", font=font_label, bg="#374151", fg="white", padx=15, pady=15)
         f_part.grid(row=0, column=1, sticky="nsew", padx=10)
 
@@ -652,7 +643,6 @@ class IndustrialVisionApp:
                 entry.insert(0, val)
         except: pass
 
-    # Методы CRUD для Types
     def meta_add_type(self):
         val = self.ent_type.get().strip()
         if not val: return
@@ -699,7 +689,6 @@ class IndustrialVisionApp:
                 self.ent_type.delete(0, tk.END)
         except: pass
 
-    # Методы CRUD для Parts
     def meta_add_part(self):
         v_type = self.cb_meta_type.get()
         val = self.ent_part.get().strip()
@@ -754,14 +743,10 @@ class IndustrialVisionApp:
         elif tab_id == 3:
             self.load_metadata_tab()
 
-    # --- ОСНОВНОЙ ЦИКЛ КАМЕРЫ ---
-    import base64
-
-    def play_success_sound(text_to_speak):
+    def play_success_sound(self, text_to_speak):
         def _play():
             if not self.audio_lock.acquire(blocking=False): return
             try:
-                # Кодируем текст в UTF-16LE и затем в Base64 для безопасной передачи в PowerShell
                 bytes_str = text_to_speak.encode('utf-16le')
                 b64_str = base64.b64encode(bytes_str).decode('utf-8')
 
@@ -774,9 +759,11 @@ class IndustrialVisionApp:
                 subprocess.run(["powershell.exe", "-WindowStyle", "Hidden", "-EncodedCommand", 
                                 base64.b64encode(ps_command.encode('utf-16le')).decode('utf-8')], 
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except: pass
-        finally: self.audio_lock.release()
-    threading.Thread(target=_play, daemon=True).start()
+            except: 
+                pass
+            finally: 
+                self.audio_lock.release()
+        threading.Thread(target=_play, daemon=True).start()
    
     def update_frame(self):
         global latest_frame, latest_crop, latest_raw_crop, scan_results
@@ -795,13 +782,17 @@ class IndustrialVisionApp:
             start_y, start_x = max(0, start_y), max(0, start_x)
 
             crop = frame[start_y:start_y+size, start_x:start_x+size]
-            latest_raw_crop = crop.copy()
-            latest_crop = cv2.resize(crop, (400, 400), interpolation=cv2.INTER_AREA)
+            
+            with state_lock:
+                latest_raw_crop = crop.copy()
+                latest_crop = cv2.resize(crop, (400, 400), interpolation=cv2.INTER_AREA)
             
             self.frame_counter += 1
             if self.frame_counter % 10 == 0 and not self.is_inferencing:
                 self.is_inferencing = True
-                threading.Thread(target=self.recognize_part_thread, args=(latest_crop.copy(),), daemon=True).start()
+                with state_lock:
+                    crop_for_inf = latest_crop.copy()
+                threading.Thread(target=self.recognize_part_thread, args=(crop_for_inf,), daemon=True).start()
 
             tab_id = self.notebook.index(self.notebook.select())
             crop_h, crop_w = crop.shape[:2]
@@ -820,7 +811,8 @@ class IndustrialVisionApp:
                 cv2.drawMarker(crop, (crop_w//2, crop_h//2), (255, 255, 255), cv2.MARKER_CROSS, 40, 2)
 
             ui_frame = cv2.resize(crop, (650, 650), interpolation=cv2.INTER_LINEAR)
-            with state_lock: latest_frame = ui_frame.copy()
+            with state_lock: 
+                latest_frame = ui_frame.copy()
             
             img_tk = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(ui_frame, cv2.COLOR_BGR2RGB)))
             
@@ -917,7 +909,8 @@ class IndustrialVisionApp:
                     }
 
     def sync_scanner_ui(self):
-        with state_lock: sr = scan_results.copy()
+        with state_lock: 
+            sr = scan_results.copy()
         
         if self.lbl_part.cget("text") != sr['part']:
             self.lbl_part.config(text=sr['part'])
@@ -936,7 +929,8 @@ class IndustrialVisionApp:
             self.lbl_sim2_img.config(image=img_sim2); self.lbl_sim2_img.image = img_sim2
 
     def on_closing(self):
-        if self.cap and self.cap.isOpened(): self.cap.release()
+        if self.cap and self.cap.isOpened(): 
+            self.cap.release()
         self.root.destroy()
 
 
@@ -1010,7 +1004,6 @@ HTML_TEMPLATE = """
         <button class="nav-btn" onclick="switchTab('metadata', this)">⚙️ Справочники</button>
     </div>
 
-    <!-- Вкладка 1: Сканер -->
     <div id="scanner" class="tab-content active scanner-container">
         <div class="left-panel">
             <h3>🔍 РЕЗУЛЬТАТ</h3>
@@ -1035,7 +1028,6 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- Вкладка 2: Регистрация -->
     <div id="register" class="tab-content reg-container">
         <div class="reg-card">
             <h2 style="margin-top:0; color:#111827; border-bottom:2px solid #D1D5DB; padding-bottom:10px;">⚙️ РЕГИСТРАЦИЯ</h2>
@@ -1053,7 +1045,6 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- Вкладка 3: База Данных -->
     <div id="gallery" class="tab-content gallery-container">
         <h1 style="color:#111827; text-align:center; margin-top:0;">📸 Галерея эталонов</h1>
         <div class="filters">
@@ -1063,7 +1054,6 @@ HTML_TEMPLATE = """
         <div class="grid" id="galleryGrid"></div>
     </div>
 
-    <!-- Вкладка 4: Справочники -->
     <div id="metadata" class="tab-content meta-container">
         <h2 style="text-align: center; margin-top: 0;">⚙️ Управление справочниками</h2>
         <div class="meta-grid" style="grid-template-columns: 1fr; max-width: 900px; margin-bottom: 20px;">
@@ -1414,7 +1404,11 @@ def save_api():
     data = request.json
     v_type, part = data.get('type'), data.get('part')
     
-    if latest_crop is None or latest_raw_crop is None:
+    with state_lock:
+        local_crop = latest_crop.copy() if latest_crop is not None else None
+        local_raw = latest_raw_crop.copy() if latest_raw_crop is not None else None
+
+    if local_crop is None or local_raw is None:
         return jsonify({"status": "error", "message": "Нет кадра с камеры"})
         
     types = load_list("types.txt", [])
@@ -1423,14 +1417,14 @@ def save_api():
     if part not in parts: save_list(f"parts_{v_type}.txt", parts + [part])
 
     try:
-        img_pil = Image.fromarray(cv2.cvtColor(latest_crop, cv2.COLOR_BGR2RGB))
+        img_pil = Image.fromarray(cv2.cvtColor(local_crop, cv2.COLOR_BGR2RGB))
         with torch.no_grad():
             vector = resnet(preprocess(img_pil).unsqueeze(0))[0].detach().numpy().tolist()
 
         point_id = str(uuid.uuid4())
         save_dir = os.path.join(BASE_DIR, v_type, part)
         os.makedirs(save_dir, exist_ok=True)
-        cv2.imwrite(os.path.join(save_dir, f"{point_id}.jpg"), latest_raw_crop)
+        cv2.imwrite(os.path.join(save_dir, f"{point_id}.jpg"), local_raw)
 
         with qdrant_lock:
             client.upsert(

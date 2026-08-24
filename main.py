@@ -1,6 +1,10 @@
 import io
 import sys
 import os
+# Включаем штатную диагностику OpenCV до первого import cv2. В EXE она
+# полезна при обращении к драйверам DirectShow/Media Foundation.
+os.environ.setdefault("OPENCV_VIDEOIO_DEBUG", "1")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "DEBUG")
 import cv2
 import torch
 import uuid
@@ -63,6 +67,46 @@ def camera_log(message):
             f.write(text + "\n")
     except Exception:
         pass
+
+
+def camera_log_system_diagnostics():
+    """Пишет в camera_debug.log максимум данных без изменения настроек ПК."""
+    camera_log("========== РАСШИРЕННАЯ ДИАГНОСТИКА КАМЕРЫ ==========")
+    camera_log(f"Python: {sys.version.replace(chr(10), ' ')}")
+    camera_log(f"EXE: {sys.executable}")
+    camera_log(f"OpenCV: {cv2.__version__}; файл: {getattr(cv2, '__file__', 'неизвестно')}")
+    camera_log(f"Windows: {os.name}; frozen={getattr(sys, 'frozen', False)}")
+    try:
+        backend_ids = cv2.videoio_registry.getCameraBackends()
+        backend_names = [cv2.videoio_registry.getBackendName(x) for x in backend_ids]
+        camera_log(f"Доступные camera backends OpenCV: {list(zip(backend_ids, backend_names))}")
+    except Exception as e:
+        camera_log(f"Не удалось получить backends OpenCV: {repr(e)}")
+
+    if os.name != "nt":
+        return
+
+    commands = {
+        "PnP camera/image devices": (
+            "Get-PnpDevice -PresentOnly | Where-Object { $_.Class -in "
+            "'Camera','Image' } | Format-List Status,Class,FriendlyName,InstanceId"
+        ),
+        "Camera-related processes": (
+            "Get-Process | Where-Object { $_.ProcessName -match "
+            "'camera|zoom|teams|skype|discord|obs|browser' } | "
+            "Select-Object ProcessName,Id,Path | Format-Table -AutoSize"
+        ),
+    }
+    for title, command in commands.items():
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12,
+            )
+            output = (result.stdout or result.stderr or "нет данных").strip()
+            camera_log(f"{title} (exit={result.returncode}):\n{output}")
+        except Exception as e:
+            camera_log(f"{title}: ошибка запуска диагностики: {repr(e)}")
     try:
         print(text)
     except Exception:
@@ -150,6 +194,10 @@ class IndustrialVisionApp:
         self.camera_retry_after = 0
         self.camera_frame_failures = 0
         self.camera_reconnect_scheduled = False
+        self.camera_dark_frames = 0
+        self.camera_backend_preference = None
+        self.active_camera_backend = ""
+        self.system_diagnostics_logged = False
         self.available_cameras = []
         self.camera_error = "Камера еще не проверялась"
 
@@ -245,6 +293,12 @@ class IndustrialVisionApp:
 
         resolutions = [(640, 480), (1280, 720)]
 
+        # При чёрном потоке DirectShow обычно виноват драйвер. При следующем
+        # подключении сначала пробуем Media Foundation, не меняя индекс камеры.
+        preferred_backend = getattr(self, "camera_backend_preference", None)
+        if preferred_backend:
+            backends.sort(key=lambda item: 0 if item[0] == preferred_backend else 1)
+
         for backend_name, backend in backends:
             cap = None
             try:
@@ -256,6 +310,24 @@ class IndustrialVisionApp:
                     if cap:
                         cap.release()
                     continue
+
+                try:
+                    actual_backend = cap.getBackendName()
+                except Exception:
+                    actual_backend = "неизвестно"
+                try:
+                    fourcc_value = int(cap.get(cv2.CAP_PROP_FOURCC))
+                    fourcc = "".join(chr((fourcc_value >> (8 * n)) & 0xFF) for n in range(4))
+                    properties = (
+                        f"backend={actual_backend}; size={cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f}x"
+                        f"{cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f}; fps={cap.get(cv2.CAP_PROP_FPS):.2f}; "
+                        f"fourcc={fourcc!r}; exposure={cap.get(cv2.CAP_PROP_EXPOSURE):.3f}; "
+                        f"auto_exposure={cap.get(cv2.CAP_PROP_AUTO_EXPOSURE):.3f}; "
+                        f"brightness={cap.get(cv2.CAP_PROP_BRIGHTNESS):.3f}"
+                    )
+                    camera_log(f"Камера #{idx} / {backend_name}: открыта. {properties}")
+                except Exception as e:
+                    camera_log(f"Камера #{idx} / {backend_name}: параметры недоступны: {repr(e)}")
 
                 # Сначала пробуем стандартный режим. Некоторые драйверы
                 # начинают отдавать кадры только после нескольких read().
@@ -269,8 +341,21 @@ class IndustrialVisionApp:
                     except Exception:
                         pass
 
-                    for _ in range(8):
+                    for attempt in range(8):
+                        read_started = time.perf_counter()
                         ret, frame = cap.read()
+                        read_ms = (time.perf_counter() - read_started) * 1000
+                        if ret and frame is not None and frame.size > 0:
+                            camera_log(
+                                f"Камера #{idx} / {backend_name}: read {attempt + 1}/8 OK; "
+                                f"{frame.shape}; mean={float(frame.mean()):.2f}; "
+                                f"min={int(frame.min())}; max={int(frame.max())}; {read_ms:.1f} ms"
+                            )
+                        else:
+                            camera_log(
+                                f"Камера #{idx} / {backend_name}: read {attempt + 1}/8 FALSE; "
+                                f"frame={None if frame is None else frame.shape}; {read_ms:.1f} ms"
+                            )
                         if ret and frame is not None and frame.size > 0:
                             good_frame = frame
                             break
@@ -293,6 +378,7 @@ class IndustrialVisionApp:
 
                 h, w = good_frame.shape[:2]
                 camera_log(f"КАМЕРА НАЙДЕНА: index={idx}, backend={backend_name}, size={w}x{h}")
+                self.active_camera_backend = backend_name
                 return cap
 
             except Exception as e:
@@ -349,6 +435,9 @@ class IndustrialVisionApp:
 
         def worker():
             try:
+                if not self.system_diagnostics_logged:
+                    self.system_diagnostics_logged = True
+                    camera_log_system_diagnostics()
                 found = self.scan_available_cameras()
                 self.ui_queue.put(lambda: self.finish_camera_scan(found))
             except Exception as e:
@@ -455,6 +544,7 @@ class IndustrialVisionApp:
             save_camera_index(idx)
 
         self.camera_frame_failures = 0
+        self.camera_dark_frames = 0
         self.set_camera_status(f"✅ Камера #{idx} подключена")
         camera_log(f"Рабочая камера: #{idx}")
         if show_message:
@@ -464,6 +554,13 @@ class IndustrialVisionApp:
     def init_camera(self):
         """Совместимый алиас: запускает полный асинхронный поиск камер."""
         self.start_camera_scan()
+
+    def reconnect_camera_with_next_backend(self, idx):
+        """Переподключает устройство после серии полностью чёрных кадров."""
+        try:
+            self.switch_camera(idx, show_message=False)
+        finally:
+            self.camera_reconnect_scheduled = False
 
     def process_ui_queue(self):
         try:
@@ -1050,7 +1147,7 @@ class IndustrialVisionApp:
             # В старой версии при неудаче поиска здесь был вечный цикл без
             # повторного подключения. Теперь камера автоматически переподключается.
             self.set_camera_status("🔎 Камера не подключена — повторный поиск...")
-            if not self.camera_scan_in_progress:
+            if not self.camera_scan_in_progress and not self.camera_reconnect_scheduled:
                 now = time.time()
                 if now >= self.camera_retry_after:
                     self.camera_retry_after = now + 3.0
@@ -1091,7 +1188,43 @@ class IndustrialVisionApp:
             return
 
         self.camera_frame_failures = 0
-        self.set_camera_status(f"🟢 Камера #{load_camera_index()} работает")
+
+        # isOpened()/read() бывают успешны, хотя драйвер DirectShow отдаёт
+        # только чёрные пиксели. По 30 кадрам отличаем это от одного сбоя и
+        # переключаем backend, сохраняя выбранную камеру.
+        brightness = float(frame.mean())
+        if (self.frame_counter + 1) % 60 == 0:
+            camera_log(
+                f"Рабочий поток #{CAMERA_INDEX}: кадр {self.frame_counter + 1}; "
+                f"shape={frame.shape}; mean={brightness:.2f}; "
+                f"min={int(frame.min())}; max={int(frame.max())}"
+            )
+        if brightness <= 3.0:
+            self.camera_dark_frames += 1
+            if self.camera_dark_frames >= 30 and not self.camera_reconnect_scheduled:
+                current_backend = self.active_camera_backend
+                self.camera_backend_preference = "MSMF" if current_backend == "DSHOW" else "DSHOW"
+                camera_log(
+                    f"Камера #{CAMERA_INDEX}: 30 чёрных кадров подряд "
+                    f"(яркость={brightness:.2f}); пробуем {self.camera_backend_preference}"
+                )
+                self.camera_reconnect_scheduled = True
+                with self.camera_lock:
+                    bad_cap = self.cap
+                    self.cap = None
+                try:
+                    if bad_cap:
+                        bad_cap.release()
+                except Exception:
+                    pass
+                self.root.after(
+                    300,
+                    lambda index=CAMERA_INDEX: self.reconnect_camera_with_next_backend(index),
+                )
+            self.set_camera_status("⚠️ Камера отдаёт чёрный кадр — восстанавливаем поток...")
+        else:
+            self.camera_dark_frames = 0
+            self.set_camera_status(f"🟢 Камера #{load_camera_index()} работает")
 
         frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]

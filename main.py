@@ -19,14 +19,22 @@ from torchvision.models import resnet50, ResNet50_Weights
 # --- ИМПОРТЫ ДЛЯ FLASK ---
 from flask import Flask, Response, render_template_string, jsonify, request, send_from_directory
 
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
+if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+else:
+    try:
+        sys.stdout = open(os.devnull, "w", encoding='utf-8')
+    except:
+        pass
 
-# Принудительно меняем кодировку вывода на UTF-8
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+if sys.stderr is not None and hasattr(sys.stderr, 'buffer'):
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+else:
+    try:
+        sys.stderr = open(os.devnull, "w", encoding='utf-8')
+    except:
+        pass
+        
 
 # --- НАСТРОЙКИ СИСТЕМЫ ---
 CAMERA_INDEX_FILE = "camera_index.txt"

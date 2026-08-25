@@ -6,6 +6,7 @@ import os
 os.environ.setdefault("OPENCV_VIDEOIO_DEBUG", "1")
 os.environ.setdefault("OPENCV_LOG_LEVEL", "DEBUG")
 import cv2
+import numpy as np
 import torch
 import uuid
 import base64
@@ -174,6 +175,639 @@ def save_list(filename, data_list):
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(data_list))
 
+
+# =====================================================================
+# CAMERA MANAGER
+# Один владелец VideoCapture + один reader thread.
+# Tkinter и Flask получают только копию последнего кадра.
+# =====================================================================
+class CameraManager:
+    """
+    Надежная работа с Windows-камерами для .py и PyInstaller EXE.
+
+    Ключевой принцип:
+      - только CameraManager владеет cv2.VideoCapture;
+      - только reader thread вызывает cap.read();
+      - GUI/Flask никогда не вызывают cap.read()/release();
+      - при переключении сначала останавливается reader и освобождается
+        старый capture, затем открывается новый;
+      - найденный рабочий capture не открывается второй раз.
+    """
+
+    MAX_INDEX = 10
+    READ_INTERVAL = 0.001
+    STARTUP_READS = 12
+    STARTUP_DELAY = 0.05
+    RECONNECT_DELAY = 0.35
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.frame_lock = threading.Lock()
+
+        self.cap = None
+        self.reader_thread = None
+        self.stop_event = threading.Event()
+
+        self.index = load_camera_index()
+        self.backend_name = ""
+        self.backend = None
+
+        self.available_cameras = []
+        self.status = "Камера еще не проверялась"
+        self.last_error = ""
+        self.last_frame = None
+        self.last_frame_time = 0.0
+
+        self.frame_failures = 0
+        self.dark_frames = 0
+        self.running = False
+        self.scan_in_progress = False
+
+        self._generation = 0
+
+    # -----------------------------
+    # Logging / status
+    # -----------------------------
+    def _set_status(self, text):
+        with self.lock:
+            self.status = text
+
+    def get_status(self):
+        with self.lock:
+            return self.status
+
+    def get_state(self):
+        with self.lock:
+            active = self.running and self.cap is not None
+            return {
+                "camera_index": self.index,
+                "backend": self.backend_name,
+                "available": list(self.available_cameras),
+                "active": bool(active),
+                "status": self.status,
+                "error": self.last_error,
+            }
+
+    # -----------------------------
+    # Backend selection
+    # -----------------------------
+    def backend_candidates(self):
+        if os.name != "nt":
+            return [("ANY", cv2.CAP_ANY)]
+
+        result = []
+
+        msmf = getattr(cv2, "CAP_MSMF", None)
+        dshow = getattr(cv2, "CAP_DSHOW", None)
+        any_backend = getattr(cv2, "CAP_ANY", 0)
+
+        # MSMF first: it is usually the safer Windows choice for modern UVC cameras.
+        if msmf is not None:
+            result.append(("MSMF", msmf))
+        if dshow is not None:
+            result.append(("DSHOW", dshow))
+        result.append(("ANY", any_backend))
+
+        # Remove duplicate backend IDs while preserving order.
+        seen = set()
+        unique = []
+        for name, backend in result:
+            if backend not in seen:
+                seen.add(backend)
+                unique.append((name, backend))
+        return unique
+
+    def _ordered_backends(self, preferred=None):
+        items = self.backend_candidates()
+        if preferred:
+            items.sort(key=lambda x: 0 if x[0] == preferred else 1)
+        return items
+
+    # -----------------------------
+    # Frame validation
+    # -----------------------------
+    @staticmethod
+    def frame_info(frame):
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            return {
+                "valid": False,
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0,
+                "max": 0,
+                "nonzero": 0.0,
+            }
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mean = float(gray.mean())
+        std = float(gray.std())
+        nonzero = float(np.count_nonzero(gray)) / float(gray.size)
+
+        return {
+            "valid": True,
+            "mean": mean,
+            "std": std,
+            "min": int(gray.min()),
+            "max": int(gray.max()),
+            "nonzero": nonzero,
+        }
+
+    @classmethod
+    def is_real_frame(cls, frame):
+        """
+        Не считаем нормальное темное изображение черным.
+        Настоящий "black frame" обычно имеет одновременно очень низкие
+        mean/std и почти все пиксели одинаковые.
+        """
+        info = cls.frame_info(frame)
+        if not info["valid"]:
+            return False
+
+        return not (
+            info["mean"] < 3.0
+            and info["std"] < 2.0
+            and info["nonzero"] < 0.01
+        )
+
+    # -----------------------------
+    # Open one camera
+    # -----------------------------
+    def _try_open(self, idx, backend_name, backend):
+        cap = None
+        try:
+            camera_log(f"[CameraManager] Open index={idx}, backend={backend_name}")
+
+            cap = cv2.VideoCapture(idx, backend)
+
+            if cap is None or not cap.isOpened():
+                camera_log(
+                    f"[CameraManager] index={idx}/{backend_name}: open=FALSE"
+                )
+                if cap is not None:
+                    cap.release()
+                return None, None
+
+            try:
+                actual = cap.getBackendName()
+            except Exception:
+                actual = backend_name
+
+            # Do NOT force MJPG or a specific FOURCC here.
+            # First let the driver negotiate its default UVC mode.
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
+            # We intentionally do not require a particular resolution.
+            # First valid frame wins. This avoids black streams caused by
+            # unsupported width/height combinations.
+            good_frame = None
+
+            for attempt in range(self.STARTUP_READS):
+                started = time.perf_counter()
+                try:
+                    ret, frame = cap.read()
+                except Exception as e:
+                    ret, frame = False, None
+                    camera_log(
+                        f"[CameraManager] index={idx}/{backend_name}: "
+                        f"read exception: {repr(e)}"
+                    )
+
+                elapsed = (time.perf_counter() - started) * 1000.0
+
+                if ret and frame is not None and frame.size:
+                    info = self.frame_info(frame)
+                    camera_log(
+                        f"[CameraManager] index={idx}/{backend_name}: "
+                        f"read {attempt + 1}/{self.STARTUP_READS} OK; "
+                        f"shape={frame.shape}; mean={info['mean']:.2f}; "
+                        f"std={info['std']:.2f}; min={info['min']}; "
+                        f"max={info['max']}; nonzero={info['nonzero']:.3f}; "
+                        f"{elapsed:.1f} ms"
+                    )
+
+                    if self.is_real_frame(frame):
+                        good_frame = frame
+                        break
+                else:
+                    camera_log(
+                        f"[CameraManager] index={idx}/{backend_name}: "
+                        f"read {attempt + 1}/{self.STARTUP_READS} FALSE; "
+                        f"{elapsed:.1f} ms"
+                    )
+
+                time.sleep(self.STARTUP_DELAY)
+
+            if good_frame is None:
+                camera_log(
+                    f"[CameraManager] index={idx}/{backend_name}: "
+                    f"opened but no usable image"
+                )
+                cap.release()
+                return None, None
+
+            # Optional autofocus only after a real frame was obtained.
+            try:
+                cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+            except Exception:
+                pass
+
+            try:
+                width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+            except Exception:
+                width = height = fps = 0
+
+            camera_log(
+                f"[CameraManager] WORKING CAMERA FOUND: "
+                f"index={idx}; requested_backend={backend_name}; "
+                f"actual_backend={actual}; size={width:.0f}x{height:.0f}; "
+                f"fps={fps:.2f}"
+            )
+
+            return cap, good_frame
+
+        except Exception as e:
+            camera_log(
+                f"[CameraManager] open error index={idx}/{backend_name}: {repr(e)}"
+            )
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+            return None, None
+
+    def _open_best(self, idx, preferred_backend=None):
+        for backend_name, backend in self._ordered_backends(preferred_backend):
+            cap, first_frame = self._try_open(idx, backend_name, backend)
+            if cap is not None:
+                return cap, first_frame, backend_name, backend
+
+        return None, None, "", None
+
+    # -----------------------------
+    # Reader thread
+    # -----------------------------
+    def _reader_loop(self, generation):
+        camera_log(
+            f"[CameraManager] reader thread START "
+            f"generation={generation}, index={self.index}, backend={self.backend_name}"
+        )
+
+        local_failures = 0
+
+        while not self.stop_event.is_set():
+            with self.lock:
+                if generation != self._generation:
+                    break
+                cap = self.cap
+
+            if cap is None:
+                break
+
+            try:
+                ret, frame = cap.read()
+            except Exception as e:
+                camera_log(f"[CameraManager] reader cap.read exception: {repr(e)}")
+                ret, frame = False, None
+
+            if ret and frame is not None and frame.size:
+                local_failures = 0
+
+                with self.frame_lock:
+                    self.last_frame = frame.copy()
+                    self.last_frame_time = time.time()
+
+                continue
+
+            local_failures += 1
+            with self.lock:
+                self.frame_failures = local_failures
+
+            if local_failures in (1, 5, 10, 20, 30):
+                camera_log(
+                    f"[CameraManager] reader: read failed "
+                    f"{local_failures} times; index={self.index}; "
+                    f"backend={self.backend_name}"
+                )
+
+            # Do not immediately destroy the capture after one failed read.
+            time.sleep(0.03)
+
+        camera_log(
+            f"[CameraManager] reader thread STOP generation={generation}"
+        )
+
+    def _start_reader(self):
+        with self.lock:
+            self.stop_event.clear()
+            self.running = True
+            self._generation += 1
+            generation = self._generation
+
+            thread = threading.Thread(
+                target=self._reader_loop,
+                args=(generation,),
+                daemon=True,
+                name="CameraReader",
+            )
+            self.reader_thread = thread
+
+        thread.start()
+
+    def _stop_reader_and_release(self):
+        with self.lock:
+            self._generation += 1
+            self.stop_event.set()
+            thread = self.reader_thread
+            self.reader_thread = None
+            cap = self.cap
+            self.cap = None
+            self.running = False
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception as e:
+                camera_log(f"[CameraManager] release error: {repr(e)}")
+
+        with self.frame_lock:
+            self.last_frame = None
+            self.last_frame_time = 0.0
+
+    # -----------------------------
+    # Connect / switch
+    # -----------------------------
+    def connect(self, idx=None, preferred_backend=None):
+        try:
+            idx = self.index if idx is None else int(idx)
+        except Exception:
+            return False
+
+        camera_log(
+            f"[CameraManager] CONNECT requested index={idx}, "
+            f"preferred_backend={preferred_backend}"
+        )
+
+        # Never let two readers use the same capture.
+        self._stop_reader_and_release()
+
+        self._set_status(f"🔄 Подключение камеры #{idx}...")
+
+        cap, first_frame, backend_name, backend = self._open_best(
+            idx, preferred_backend=preferred_backend
+        )
+
+        if cap is None:
+            with self.lock:
+                self.last_error = (
+                    f"Камера #{idx} не открылась или не дала пригодный кадр"
+                )
+                self.status = f"❌ Камера #{idx} не дает изображение"
+                self.backend_name = ""
+                self.backend = None
+
+            camera_log(f"[CameraManager] CONNECT FAILED index={idx}")
+            return False
+
+        with self.lock:
+            self.cap = cap
+            self.index = idx
+            self.backend_name = backend_name
+            self.backend = backend
+            self.frame_failures = 0
+            self.dark_frames = 0
+            self.last_error = ""
+            self.status = (
+                f"🟢 Камера #{idx} подключена "
+                f"({backend_name})"
+            )
+
+        save_camera_index(idx)
+
+        # Seed the shared frame with the known-good startup frame.
+        with self.frame_lock:
+            self.last_frame = first_frame.copy()
+            self.last_frame_time = time.time()
+
+        self._start_reader()
+
+        camera_log(
+            f"[CameraManager] CONNECTED index={idx}, backend={backend_name}"
+        )
+        return True
+
+    def disconnect(self):
+        camera_log("[CameraManager] DISCONNECT")
+        self._stop_reader_and_release()
+        self._set_status("Камера отключена")
+
+    # -----------------------------
+    # Discovery
+    # -----------------------------
+    def scan(self):
+        """
+        Поиск доступных камер.
+
+        Если рабочая камера уже подключена, ее индекс не открываем второй раз.
+        Остальные индексы проверяем временно и сразу освобождаем.
+        """
+        with self.lock:
+            if self.scan_in_progress:
+                return list(self.available_cameras)
+            self.scan_in_progress = True
+            active_index = self.index if self.running and self.cap is not None else None
+
+        try:
+            preferred = load_camera_index()
+            indexes = [preferred] + [
+                i for i in range(self.MAX_INDEX) if i != preferred
+            ]
+
+            found = []
+            camera_log(
+                f"[CameraManager] SCAN START; preferred={preferred}; "
+                f"active={active_index}"
+            )
+
+            if active_index is not None:
+                found.append(active_index)
+
+            for idx in indexes:
+                if idx == active_index:
+                    continue
+
+                for backend_name, backend in self._ordered_backends():
+                    cap, _ = self._try_open(idx, backend_name, backend)
+                    if cap is not None:
+                        found.append(idx)
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        break
+
+            # Stable order and no duplicates.
+            found = sorted(set(found))
+
+            with self.lock:
+                self.available_cameras = found
+                self.status = (
+                    f"🟢 Найдены камеры: {', '.join(map(str, found))}"
+                    if found else
+                    "❌ Камеры не найдены"
+                )
+
+            camera_log(f"[CameraManager] SCAN END; found={found}")
+            return found
+
+        except Exception as e:
+            camera_log(f"[CameraManager] SCAN ERROR: {repr(e)}")
+            with self.lock:
+                self.last_error = repr(e)
+                self.status = "❌ Ошибка поиска камер"
+            return []
+
+        finally:
+            with self.lock:
+                self.scan_in_progress = False
+
+    # -----------------------------
+    # Public frame API
+    # -----------------------------
+    def get_frame(self):
+        with self.frame_lock:
+            if self.last_frame is None:
+                return None
+            return self.last_frame.copy()
+
+    def get_frame_age(self):
+        with self.frame_lock:
+            if self.last_frame_time <= 0:
+                return float("inf")
+            return max(0.0, time.time() - self.last_frame_time)
+
+    def note_frame_health(self, frame):
+        """
+        Проверяет уже полученный reader thread кадр.
+        Возвращает (is_dark, info).
+        """
+        info = self.frame_info(frame)
+        is_dark = (
+            info["valid"]
+            and info["mean"] < 3.0
+            and info["std"] < 2.0
+            and info["nonzero"] < 0.01
+        )
+
+        with self.lock:
+            if is_dark:
+                self.dark_frames += 1
+            else:
+                self.dark_frames = 0
+
+        return is_dark, info
+
+    def needs_reconnect(self, max_dark_frames=60, max_age=3.0):
+        with self.lock:
+            dark = self.dark_frames
+            failures = self.frame_failures
+            running = self.running
+
+        age = self.get_frame_age()
+
+        if not running:
+            return True
+
+        if dark >= max_dark_frames:
+            return True
+
+        if failures >= 30:
+            return True
+
+        if age > max_age:
+            return True
+
+        return False
+
+    def diagnostics(self):
+        camera_log("========== CAMERA MANAGER DIAGNOSTICS ==========")
+        camera_log(f"Python: {sys.version.replace(chr(10), ' ')}")
+        camera_log(f"EXE: {sys.executable}")
+        camera_log(
+            f"OpenCV: {cv2.__version__}; "
+            f"file={getattr(cv2, '__file__', 'unknown')}"
+        )
+        camera_log(
+            f"Windows={os.name}; frozen={getattr(sys, 'frozen', False)}"
+        )
+
+        try:
+            ids = cv2.videoio_registry.getCameraBackends()
+            names = []
+            for x in ids:
+                try:
+                    names.append(cv2.videoio_registry.getBackendName(x))
+                except Exception:
+                    names.append(str(x))
+            camera_log(f"OpenCV camera backends: {list(zip(ids, names))}")
+        except Exception as e:
+            camera_log(f"Cannot enumerate OpenCV backends: {repr(e)}")
+
+        if os.name == "nt":
+            commands = {
+                "PnP camera/image devices": (
+                    "Get-PnpDevice -PresentOnly | "
+                    "Where-Object { $_.Class -in 'Camera','Image' } | "
+                    "Format-List Status,Class,FriendlyName,InstanceId"
+                ),
+                "Camera-related processes": (
+                    "Get-Process | "
+                    "Where-Object { $_.ProcessName -match "
+                    "'camera|zoom|teams|skype|discord|obs|browser' } | "
+                    "Select-Object ProcessName,Id,Path | "
+                    "Format-Table -AutoSize"
+                ),
+            }
+
+            for title, command in commands.items():
+                try:
+                    result = subprocess.run(
+                        [
+                            "powershell",
+                            "-NoProfile",
+                            "-Command",
+                            command,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=12,
+                    )
+                    output = (
+                        result.stdout or result.stderr or "нет данных"
+                    ).strip()
+                    camera_log(
+                        f"{title} (exit={result.returncode}):\n{output}"
+                    )
+                except Exception as e:
+                    camera_log(
+                        f"{title}: diagnostic error: {repr(e)}"
+                    )
+
+    def shutdown(self):
+        camera_log("[CameraManager] SHUTDOWN")
+        self._stop_reader_and_release()
+
+
 # =====================================================================
 # TKINTER DESKTOP APP (Сканер + Регистрация + Галерея + Справочники)
 # =====================================================================
@@ -187,19 +821,18 @@ class IndustrialVisionApp:
         self.ui_queue = queue.Queue()
         self.process_ui_queue()
 
-        self.cap = None
-        self.camera_lock = threading.RLock()
-        self.camera_scan_lock = threading.Lock()
-        self.camera_scan_in_progress = False
-        self.camera_retry_after = 0
-        self.camera_frame_failures = 0
-        self.camera_reconnect_scheduled = False
-        self.camera_dark_frames = 0
-        self.camera_backend_preference = None
-        self.active_camera_backend = ""
-        self.system_diagnostics_logged = False
+        # Новый CameraManager: только он владеет VideoCapture.
+        self.camera_manager = CameraManager()
+        self.camera_lock = self.camera_manager.lock
         self.available_cameras = []
         self.camera_error = "Камера еще не проверялась"
+        self.camera_scan_in_progress = False
+        self.camera_retry_after = 0
+        self.camera_reconnect_scheduled = False
+        self.camera_frame_failures = 0
+        self.camera_dark_frames = 0
+        self.active_camera_backend = ""
+        self.system_diagnostics_logged = False
 
         self.frame_counter = 0
         self.scan_line_y = 0
@@ -254,10 +887,9 @@ class IndustrialVisionApp:
         self.root.after(100, self.update_frame)
 
     # =================================================================
-    # КАМЕРА — НОВАЯ ЛОГИКА
+    # КАМЕРА — CameraManager
     # =================================================================
     def set_camera_status(self, text):
-        """Обновляет статус камеры в GUI, если элементы уже созданы."""
         self.camera_error = text
         try:
             if hasattr(self, "camera_status_label"):
@@ -266,7 +898,6 @@ class IndustrialVisionApp:
             pass
 
     def open_windows_camera_settings(self):
-        """Открывает системное разрешение камеры Windows."""
         try:
             if os.name == "nt":
                 os.startfile("ms-settings:privacy-webcam")
@@ -276,225 +907,113 @@ class IndustrialVisionApp:
             camera_log(f"Не удалось открыть настройки приватности камеры: {e}")
         return False
 
-    def open_camera(self, idx):
-        """
-        Проверяет одну физическую камеру через несколько Windows backend'ов.
-        Не фиксируем MJPG до успешного кадра — это часто ломает камеры в EXE.
-        """
-        backends = []
-        if os.name == "nt":
-            backends = [
-                ("DSHOW", getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)),
-                ("MSMF", getattr(cv2, "CAP_MSMF", cv2.CAP_ANY)),
-                ("ANY", cv2.CAP_ANY),
-            ]
-        else:
-            backends = [("ANY", cv2.CAP_ANY)]
-
-        resolutions = [(640, 480), (1280, 720)]
-
-        # При чёрном потоке DirectShow обычно виноват драйвер. При следующем
-        # подключении сначала пробуем Media Foundation, не меняя индекс камеры.
-        preferred_backend = getattr(self, "camera_backend_preference", None)
-        if preferred_backend:
-            backends.sort(key=lambda item: 0 if item[0] == preferred_backend else 1)
-
-        for backend_name, backend in backends:
-            cap = None
-            try:
-                camera_log(f"Проверка камеры #{idx} через {backend_name}")
-                cap = cv2.VideoCapture(idx, backend)
-
-                if not cap or not cap.isOpened():
-                    camera_log(f"Камера #{idx} / {backend_name}: open() = FALSE")
-                    if cap:
-                        cap.release()
-                    continue
-
-                try:
-                    actual_backend = cap.getBackendName()
-                except Exception:
-                    actual_backend = "неизвестно"
-                try:
-                    fourcc_value = int(cap.get(cv2.CAP_PROP_FOURCC))
-                    fourcc = "".join(chr((fourcc_value >> (8 * n)) & 0xFF) for n in range(4))
-                    properties = (
-                        f"backend={actual_backend}; size={cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f}x"
-                        f"{cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f}; fps={cap.get(cv2.CAP_PROP_FPS):.2f}; "
-                        f"fourcc={fourcc!r}; exposure={cap.get(cv2.CAP_PROP_EXPOSURE):.3f}; "
-                        f"auto_exposure={cap.get(cv2.CAP_PROP_AUTO_EXPOSURE):.3f}; "
-                        f"brightness={cap.get(cv2.CAP_PROP_BRIGHTNESS):.3f}"
-                    )
-                    camera_log(f"Камера #{idx} / {backend_name}: открыта. {properties}")
-                except Exception as e:
-                    camera_log(f"Камера #{idx} / {backend_name}: параметры недоступны: {repr(e)}")
-
-                # Сначала пробуем стандартный режим. Некоторые драйверы
-                # начинают отдавать кадры только после нескольких read().
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-                good_frame = None
-                for width, height in resolutions:
-                    try:
-                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-                    except Exception:
-                        pass
-
-                    for attempt in range(8):
-                        read_started = time.perf_counter()
-                        ret, frame = cap.read()
-                        read_ms = (time.perf_counter() - read_started) * 1000
-                        if ret and frame is not None and frame.size > 0:
-                            camera_log(
-                                f"Камера #{idx} / {backend_name}: read {attempt + 1}/8 OK; "
-                                f"{frame.shape}; mean={float(frame.mean()):.2f}; "
-                                f"min={int(frame.min())}; max={int(frame.max())}; {read_ms:.1f} ms"
-                            )
-                        else:
-                            camera_log(
-                                f"Камера #{idx} / {backend_name}: read {attempt + 1}/8 FALSE; "
-                                f"frame={None if frame is None else frame.shape}; {read_ms:.1f} ms"
-                            )
-                        if ret and frame is not None and frame.size > 0:
-                            good_frame = frame
-                            break
-                        time.sleep(0.08)
-
-                    if good_frame is not None:
-                        break
-
-                if good_frame is None:
-                    camera_log(f"Камера #{idx} / {backend_name}: open() есть, но read() не дает кадр")
-                    cap.release()
-                    continue
-
-                # Не навязываем FOURCC/MJPG: драйвер камеры сам выбирает рабочий формат.
-
-                try:
-                    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-                except Exception:
-                    pass
-
-                h, w = good_frame.shape[:2]
-                camera_log(f"КАМЕРА НАЙДЕНА: index={idx}, backend={backend_name}, size={w}x{h}")
-                self.active_camera_backend = backend_name
-                return cap
-
-            except Exception as e:
-                camera_log(f"Ошибка камеры #{idx} / {backend_name}: {repr(e)}")
-                try:
-                    if cap:
-                        cap.release()
-                except Exception:
-                    pass
-
-        return None
-
-    def scan_available_cameras(self):
-        """Поиск камер без повторного открытия уже работающего устройства.
-
-        Важно: на Windows второй VideoCapture того же индекса может оборвать
-        первый поток DirectShow. Поэтому активная камера добавляется в результат
-        и исключается из проверки.
-        """
-        found = []
-        preferred = load_camera_index()
-        indexes = [preferred] + [i for i in range(10) if i != preferred]
-        active_index = None
-        with self.camera_lock:
-            if self.cap is not None and self.cap.isOpened():
-                active_index = CAMERA_INDEX
-
-        camera_log(f"=== НАЧАЛО ПОИСКА КАМЕР. Приоритет #{preferred} ===")
-        if active_index is not None:
-            found.append(active_index)
-            camera_log(f"Камера #{active_index} уже подключена — повторно не открываем")
-
-        for idx in indexes:
-            if idx == active_index:
-                continue
-            cap = self.open_camera(idx)
-            if cap is not None:
-                found.append(idx)
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-
-        camera_log(f"=== ПОИСК ЗАВЕРШЕН. Найдены камеры: {found} ===")
-        return found
-
     def start_camera_scan(self):
-        """Запускает поиск камеры в отдельном потоке."""
-        with self.camera_scan_lock:
-            if self.camera_scan_in_progress:
-                return
-            self.camera_scan_in_progress = True
+        """
+        Асинхронный поиск.
+        Важно: если камера уже работает, ее VideoCapture не трогаем.
+        """
+        if self.camera_scan_in_progress:
+            return
+
+        self.camera_scan_in_progress = True
         self.set_camera_status("🔎 Ищем доступные камеры...")
 
         def worker():
             try:
                 if not self.system_diagnostics_logged:
                     self.system_diagnostics_logged = True
-                    camera_log_system_diagnostics()
-                found = self.scan_available_cameras()
-                self.ui_queue.put(lambda: self.finish_camera_scan(found))
-            except Exception as e:
-                camera_log(f"Критическая ошибка поиска камер: {repr(e)}")
-                self.ui_queue.put(lambda: self.finish_camera_scan([]))
+                    self.camera_manager.diagnostics()
 
-        threading.Thread(target=worker, daemon=True, name="CameraScanner").start()
+                found = self.camera_manager.scan()
+                self.ui_queue.put(
+                    lambda found=found: self.finish_camera_scan(found)
+                )
+            except Exception as e:
+                camera_log(
+                    f"Критическая ошибка поиска камер: {repr(e)}"
+                )
+                self.ui_queue.put(
+                    lambda: self.finish_camera_scan([])
+                )
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="CameraScanner",
+        ).start()
 
     def finish_camera_scan(self, found):
         self.camera_scan_in_progress = False
-        self.available_cameras = found
+        self.available_cameras = list(found)
+        self.camera_manager.available_cameras = list(found)
 
-        # Обновляем список в настройках.
         try:
             if hasattr(self, "cb_camera_idx"):
-                values = [str(x) for x in found] if found else ["0"]
+                values = [str(x) for x in found] if found else [
+                    str(load_camera_index())
+                ]
                 self.cb_camera_idx["values"] = values
-                if str(load_camera_index()) in values:
-                    self.cb_camera_idx.set(str(load_camera_index()))
-                else:
-                    self.cb_camera_idx.set(values[0])
+                current = str(load_camera_index())
+                self.cb_camera_idx.set(
+                    current if current in values else values[0]
+                )
         except Exception:
             pass
 
         if not found:
-            self.cap = None
-            self.set_camera_status("❌ Камера не найдена. Проверьте разрешение Windows и USB.")
-            camera_log("Камера не найдена. Открываем настройки приватности Windows.")
+            self.set_camera_status(
+                "❌ Камера не найдена. Проверьте USB и разрешения Windows."
+            )
+            camera_log(
+                "Камера не найдена. Открываем настройки приватности Windows."
+            )
             try:
                 self.open_windows_camera_settings()
                 messagebox.showwarning(
                     "Камера не найдена",
-                    "Программа не получила кадр ни с одной камеры.\n\n"
-                    "Откройте настройки Windows и включите:\n"
+                    "Программа не получила рабочий кадр ни с одной камеры.\n\n"
+                    "Проверьте:\n"
                     "• Доступ к камере\n"
                     "• Разрешить приложениям доступ к камере\n"
-                    "• Разрешить классическим приложениям доступ к камере\n\n"
-                    "После этого нажмите «Повторить поиск камеры».\n\n"
-                    "Подробный лог: camera_debug.log"
+                    "• Разрешить классическим приложениям доступ к камере\n"
+                    "• USB-подключение и драйвер камеры\n\n"
+                    "После этого нажмите «Найти камеры».\n\n"
+                    "Подробный лог: camera_debug.log",
                 )
             except Exception:
                 pass
+
             self.root.after(3000, self.start_camera_scan)
             return
 
         preferred = load_camera_index()
         selected = preferred if preferred in found else found[0]
+
+        # Если активная камера уже выбрана, не открываем ее повторно.
+        state = self.camera_manager.get_state()
+        if state["active"] and state["camera_index"] == selected:
+            self.active_camera_backend = state["backend"]
+            self.set_camera_status(
+                f"🟢 Камера #{selected} уже работает "
+                f"({state['backend']}). "
+                f"Доступные: {', '.join(map(str, found))}"
+            )
+            return
+
         if self.switch_camera(selected, show_message=False):
             self.set_camera_status(
-                f"✅ Камера #{selected} подключена. Доступные: {', '.join(map(str, found))}"
+                f"🟢 Камера #{selected} подключена. "
+                f"Доступные: {', '.join(map(str, found))}"
             )
         else:
-            self.set_camera_status(f"❌ Не удалось подключить камеру #{selected}")
+            self.set_camera_status(
+                f"❌ Не удалось подключить камеру #{selected}"
+            )
+
+    def scan_available_cameras(self):
+        return self.camera_manager.scan()
 
     def switch_camera(self, idx, show_message=True):
-        """Безопасно переключает рабочую камеру."""
-        global CAMERA_INDEX
         try:
             idx = int(idx)
         except Exception:
@@ -503,62 +1022,79 @@ class IndustrialVisionApp:
         self.set_camera_status(f"🔄 Подключение камеры #{idx}...")
         camera_log(f"Переключение на камеру #{idx}")
 
-        # Не открываем один и тот же DirectShow-источник второй раз.
-        with self.camera_lock:
-            current = self.cap
-            already_active = bool(current and current.isOpened() and CAMERA_INDEX == idx)
-        if already_active:
-            self.camera_frame_failures = 0
-            self.set_camera_status(f"✅ Камера #{idx} уже подключена")
-            camera_log(f"Камера #{idx} уже была активна; повторное открытие пропущено")
+        state = self.camera_manager.get_state()
+        if state["active"] and state["camera_index"] == idx:
+            self.active_camera_backend = state["backend"]
+            self.set_camera_status(
+                f"🟢 Камера #{idx} уже подключена ({state['backend']})"
+            )
             return True
 
-        # При смене устройства сначала освобождаем старое. Иначе драйверы
-        # некоторых USB-камер не дают открыть новый поток.
-        with self.camera_lock:
-            old = self.cap
-            self.cap = None
-        try:
-            if old:
-                old.release()
-        except Exception:
-            pass
-        if old:
-            time.sleep(0.25)
+        ok = self.camera_manager.connect(idx)
 
-        cap = self.open_camera(idx)
-        if cap is None:
-            self.set_camera_status(f"❌ Камера #{idx} не дает кадр")
+        if not ok:
+            self.set_camera_status(
+                f"❌ Камера #{idx} не дает изображение"
+            )
             if show_message:
                 messagebox.showerror(
                     "Ошибка камеры",
-                    f"Камера #{idx} открывается, но не отдает изображение.\n\n"
-                    "Проверьте разрешения Windows или выберите другую камеру.\n\n"
-                    "Смотрите camera_debug.log."
+                    f"Камера #{idx} не отдает рабочий видеопоток.\n\n"
+                    "Попробуйте другую камеру или проверьте разрешения Windows.\n\n"
+                    "Смотрите camera_debug.log.",
                 )
             return False
 
-        with self.camera_lock:
-            self.cap = cap
-            CAMERA_INDEX = idx
-            save_camera_index(idx)
-
+        state = self.camera_manager.get_state()
+        self.active_camera_backend = state["backend"]
+        self.available_cameras = state["available"]
         self.camera_frame_failures = 0
         self.camera_dark_frames = 0
-        self.set_camera_status(f"✅ Камера #{idx} подключена")
-        camera_log(f"Рабочая камера: #{idx}")
+        self.set_camera_status(
+            f"🟢 Камера #{idx} подключена ({state['backend']})"
+        )
+        camera_log(
+            f"Рабочая камера: #{idx}, backend={state['backend']}"
+        )
+
         if show_message:
-            messagebox.showinfo("Камера", f"Камера #{idx} успешно подключена.")
+            messagebox.showinfo(
+                "Камера",
+                f"Камера #{idx} успешно подключена.\n"
+                f"Backend: {state['backend']}",
+            )
+
         return True
 
     def init_camera(self):
-        """Совместимый алиас: запускает полный асинхронный поиск камер."""
         self.start_camera_scan()
 
     def reconnect_camera_with_next_backend(self, idx):
-        """Переподключает устройство после серии полностью чёрных кадров."""
+        """
+        Совместимый алиас. CameraManager сам выбирает backend заново.
+        """
         try:
-            self.switch_camera(idx, show_message=False)
+            current_backend = self.camera_manager.get_state()["backend"]
+            backends = [x[0] for x in self.camera_manager.backend_candidates()]
+            preferred = None
+
+            if current_backend in backends:
+                pos = backends.index(current_backend)
+                if len(backends) > 1:
+                    preferred = backends[(pos + 1) % len(backends)]
+
+            self.camera_manager.connect(
+                int(idx),
+                preferred_backend=preferred,
+            )
+
+            state = self.camera_manager.get_state()
+            self.active_camera_backend = state["backend"]
+            self.set_camera_status(
+                f"🟢 Камера #{idx} восстановлена ({state['backend']})"
+                if state["active"]
+                else f"❌ Не удалось восстановить камеру #{idx}"
+            )
         finally:
             self.camera_reconnect_scheduled = False
 
@@ -1137,146 +1673,248 @@ class IndustrialVisionApp:
         threading.Thread(target=_play, daemon=True).start()
    
     def update_frame(self):
+        """
+        GUI timer НЕ читает камеру.
+
+        CameraManager.reader_thread уже получил кадр и положил его в
+        last_frame. Здесь мы только забираем копию и рисуем UI.
+        """
         global latest_frame, latest_crop, latest_raw_crop, scan_results
 
-        cap = None
-        with self.camera_lock:
-            cap = self.cap
+        frame = self.camera_manager.get_frame()
 
-        if not cap or not cap.isOpened():
-            # В старой версии при неудаче поиска здесь был вечный цикл без
-            # повторного подключения. Теперь камера автоматически переподключается.
-            self.set_camera_status("🔎 Камера не подключена — повторный поиск...")
-            if not self.camera_scan_in_progress and not self.camera_reconnect_scheduled:
+        if frame is None:
+            self.set_camera_status(
+                "🔎 Камера не подключена — повторный поиск..."
+            )
+
+            if (
+                not self.camera_scan_in_progress
+                and not self.camera_reconnect_scheduled
+            ):
                 now = time.time()
                 if now >= self.camera_retry_after:
                     self.camera_retry_after = now + 3.0
                     self.start_camera_scan()
+
             self.root.after(100, self.update_frame)
-            return
-
-        try:
-            ret, frame = cap.read()
-        except Exception as e:
-            ret, frame = False, None
-            camera_log(f"Исключение cap.read(): {repr(e)}")
-
-        if not ret or frame is None or frame.size == 0:
-            # Один сбой read() нормален для USB/встроенных камер при смене
-            # экспозиции или при старте. Не рвём рабочее соединение сразу.
-            self.camera_frame_failures += 1
-            if self.camera_frame_failures < 10:
-                self.set_camera_status(
-                    f"⚠️ Нет кадра ({self.camera_frame_failures}/10), ожидаем..."
-                )
-                self.root.after(100, self.update_frame)
-                return
-
-            camera_log(
-                f"Камера #{load_camera_index()} не отдала 10 кадров подряд — переподключение"
-            )
-            with self.camera_lock:
-                bad_cap = self.cap
-                self.cap = None
-            try:
-                if bad_cap:
-                    bad_cap.release()
-            except Exception:
-                pass
-            self.set_camera_status("⚠️ Потерян видеопоток — переподключение...")
-            self.root.after(200, self.update_frame)
             return
 
         self.camera_frame_failures = 0
 
-        # isOpened()/read() бывают успешны, хотя драйвер DirectShow отдаёт
-        # только чёрные пиксели. По 30 кадрам отличаем это от одного сбоя и
-        # переключаем backend, сохраняя выбранную камеру.
-        brightness = float(frame.mean())
-        if (self.frame_counter + 1) % 60 == 0:
+        # Health check without touching VideoCapture.
+        is_dark, info = self.camera_manager.note_frame_health(frame)
+
+        if (self.frame_counter + 1) % 120 == 0:
+            state = self.camera_manager.get_state()
             camera_log(
-                f"Рабочий поток #{CAMERA_INDEX}: кадр {self.frame_counter + 1}; "
-                f"shape={frame.shape}; mean={brightness:.2f}; "
-                f"min={int(frame.min())}; max={int(frame.max())}"
+                f"[CameraManager] UI frame #{self.frame_counter + 1}; "
+                f"index={state['camera_index']}; "
+                f"backend={state['backend']}; "
+                f"shape={frame.shape}; "
+                f"mean={info['mean']:.2f}; std={info['std']:.2f}; "
+                f"min={info['min']}; max={info['max']}; "
+                f"nonzero={info['nonzero']:.3f}; "
+                f"age={self.camera_manager.get_frame_age():.3f}s"
             )
-        if brightness <= 3.0:
+
+        if is_dark:
             self.camera_dark_frames += 1
-            if self.camera_dark_frames >= 30 and not self.camera_reconnect_scheduled:
-                current_backend = self.active_camera_backend
-                self.camera_backend_preference = "MSMF" if current_backend == "DSHOW" else "DSHOW"
-                camera_log(
-                    f"Камера #{CAMERA_INDEX}: 30 чёрных кадров подряд "
-                    f"(яркость={brightness:.2f}); пробуем {self.camera_backend_preference}"
-                )
+
+            if (
+                self.camera_dark_frames >= 60
+                and not self.camera_reconnect_scheduled
+            ):
+                state = self.camera_manager.get_state()
+
                 self.camera_reconnect_scheduled = True
-                with self.camera_lock:
-                    bad_cap = self.cap
-                    self.cap = None
-                try:
-                    if bad_cap:
-                        bad_cap.release()
-                except Exception:
-                    pass
-                self.root.after(
-                    300,
-                    lambda index=CAMERA_INDEX: self.reconnect_camera_with_next_backend(index),
+                camera_log(
+                    f"[CameraManager] 60 black frames: "
+                    f"index={state['camera_index']}, "
+                    f"backend={state['backend']}"
                 )
-            self.set_camera_status("⚠️ Камера отдаёт чёрный кадр — восстанавливаем поток...")
+
+                self.set_camera_status(
+                    "⚠️ Камера отдает черный поток — восстанавливаем..."
+                )
+
+                self.root.after(
+                    200,
+                    lambda index=state["camera_index"]:
+                    self.reconnect_camera_with_next_backend(index),
+                )
         else:
             self.camera_dark_frames = 0
-            self.set_camera_status(f"🟢 Камера #{load_camera_index()} работает")
 
+        if self.camera_manager.needs_reconnect(
+            max_dark_frames=90,
+            max_age=3.0,
+        ) and not self.camera_reconnect_scheduled:
+            state = self.camera_manager.get_state()
+
+            self.camera_reconnect_scheduled = True
+            camera_log(
+                f"[CameraManager] reconnect required: "
+                f"index={state['camera_index']}; "
+                f"backend={state['backend']}; "
+                f"age={self.camera_manager.get_frame_age():.2f}s"
+            )
+
+            self.set_camera_status(
+                "⚠️ Видеопоток потерян — переподключение..."
+            )
+
+            self.root.after(
+                200,
+                lambda index=state["camera_index"]:
+                self.reconnect_camera_with_next_backend(index),
+            )
+
+        if not is_dark:
+            state = self.camera_manager.get_state()
+            self.active_camera_backend = state["backend"]
+            self.set_camera_status(
+                f"🟢 Камера #{state['camera_index']} работает "
+                f"({state['backend']})"
+            )
+        else:
+            self.set_camera_status(
+                "⚠️ Камера отдает очень темный/черный кадр..."
+            )
+
+        # Mirror image for the operator.
         frame = cv2.flip(frame, 1)
+
         h, w = frame.shape[:2]
         zoom_level = 2.0
         size = int(min(h, w) / zoom_level)
-        start_y, start_x = int(h/2 - size/2), int(w/2 - size/2)
-        start_y, start_x = max(0, start_y), max(0, start_x)
 
-        crop = frame[start_y:start_y+size, start_x:start_x+size]
+        start_y = int(h / 2 - size / 2)
+        start_x = int(w / 2 - size / 2)
+        start_y = max(0, start_y)
+        start_x = max(0, start_x)
+
+        crop = frame[
+            start_y:start_y + size,
+            start_x:start_x + size
+        ]
+
+        if crop is None or crop.size == 0:
+            self.root.after(30, self.update_frame)
+            return
 
         with state_lock:
             latest_raw_crop = crop.copy()
-            latest_crop = cv2.resize(crop, (400, 400), interpolation=cv2.INTER_AREA)
+            latest_crop = cv2.resize(
+                crop,
+                (400, 400),
+                interpolation=cv2.INTER_AREA,
+            )
 
         self.frame_counter += 1
+
         if self.frame_counter % 10 == 0 and not self.is_inferencing:
             self.is_inferencing = True
+
             with state_lock:
                 crop_for_inf = latest_crop.copy()
-            threading.Thread(target=self.recognize_part_thread, args=(crop_for_inf,), daemon=True).start()
 
-        tab_id = self.notebook.index(self.notebook.select())
+            threading.Thread(
+                target=self.recognize_part_thread,
+                args=(crop_for_inf,),
+                daemon=True,
+                name="InferenceWorker",
+            ).start()
+
+        try:
+            tab_id = self.notebook.index(self.notebook.select())
+        except Exception:
+            tab_id = 0
+
         crop_h, crop_w = crop.shape[:2]
 
         if tab_id == 0:
             if not self.is_detected:
-                self.scan_line_y += int(crop_h * 0.05) * self.scan_line_dir
-                if self.scan_line_y >= crop_h or self.scan_line_y <= 0:
-                    self.scan_line_dir *= -1
-                    self.scan_line_y = max(0, min(self.scan_line_y, crop_h))
-                cv2.line(crop, (0, self.scan_line_y), (crop_w, self.scan_line_y), (0, 255, 0), 3)
-                cv2.drawMarker(crop, (crop_w//2, crop_h//2), (0, 165, 255), cv2.MARKER_CROSS, 40, 2)
-            else:
-                cv2.rectangle(crop, (0, 0), (crop_w-1, crop_h-1), (0, 255, 0), 8)
-        else:
-            cv2.drawMarker(crop, (crop_w//2, crop_h//2), (255, 255, 255), cv2.MARKER_CROSS, 40, 2)
+                self.scan_line_y += (
+                    int(crop_h * 0.05) * self.scan_line_dir
+                )
 
-        ui_frame = cv2.resize(crop, (650, 650), interpolation=cv2.INTER_LINEAR)
+                if (
+                    self.scan_line_y >= crop_h
+                    or self.scan_line_y <= 0
+                ):
+                    self.scan_line_dir *= -1
+                    self.scan_line_y = max(
+                        0,
+                        min(self.scan_line_y, crop_h),
+                    )
+
+                cv2.line(
+                    crop,
+                    (0, self.scan_line_y),
+                    (crop_w, self.scan_line_y),
+                    (0, 255, 0),
+                    3,
+                )
+
+                cv2.drawMarker(
+                    crop,
+                    (crop_w // 2, crop_h // 2),
+                    (0, 165, 255),
+                    cv2.MARKER_CROSS,
+                    40,
+                    2,
+                )
+            else:
+                cv2.rectangle(
+                    crop,
+                    (0, 0),
+                    (crop_w - 1, crop_h - 1),
+                    (0, 255, 0),
+                    8,
+                )
+        else:
+            cv2.drawMarker(
+                crop,
+                (crop_w // 2, crop_h // 2),
+                (255, 255, 255),
+                cv2.MARKER_CROSS,
+                40,
+                2,
+            )
+
+        ui_frame = cv2.resize(
+            crop,
+            (650, 650),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
         with state_lock:
             latest_frame = ui_frame.copy()
 
         try:
-            img_tk = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(ui_frame, cv2.COLOR_BGR2RGB)))
+            img_tk = ImageTk.PhotoImage(
+                image=Image.fromarray(
+                    cv2.cvtColor(
+                        ui_frame,
+                        cv2.COLOR_BGR2RGB,
+                    )
+                )
+            )
+
             if tab_id == 0:
                 self.video_label_scanner.imgtk = img_tk
                 self.video_label_scanner.configure(image=img_tk)
                 self.sync_scanner_ui()
+
             elif tab_id == 1:
                 self.video_label_register.imgtk = img_tk
                 self.video_label_register.configure(image=img_tk)
+
         except Exception as e:
-            camera_log(f"Ошибка отображения кадра Tkinter: {repr(e)}")
+            camera_log(
+                f"Ошибка отображения кадра Tkinter: {repr(e)}"
+            )
 
         self.root.after(30, self.update_frame)
 
@@ -1384,13 +2022,9 @@ class IndustrialVisionApp:
 
     def on_closing(self):
         try:
-            with self.camera_lock:
-                cap = self.cap
-                self.cap = None
-            if cap and cap.isOpened():
-                cap.release()
+            self.camera_manager.shutdown()
         except Exception as e:
-            camera_log(f"Ошибка закрытия камеры: {repr(e)}")
+            camera_log(f"Ошибка закрытия CameraManager: {repr(e)}")
         self.root.destroy()
 
 
@@ -1830,23 +2464,44 @@ def get_parts_api():
 
 @app_flask.route("/api/get_camera")
 def get_camera_api():
-    with state_lock:
-        active = bool(globals().get("latest_frame") is not None)
     application = globals().get("app")
+    if application:
+        state = application.camera_manager.get_state()
+        return jsonify({
+            "camera_index": state["camera_index"],
+            "available": state["available"],
+            "active": state["active"],
+            "backend": state["backend"],
+            "error": state["status"] or state["error"],
+        })
+
     return jsonify({
         "camera_index": load_camera_index(),
-        "available": getattr(application, "available_cameras", []) if application else [],
-        "active": active
+        "available": [],
+        "active": False,
+        "backend": "",
+        "error": "Приложение еще запускается",
     })
 
 @app_flask.route("/api/cameras")
 def cameras_api():
-    """Возвращает последний результат поиска камер."""
+    """Состояние CameraManager без доступа Flask к VideoCapture."""
+    if "app" not in globals():
+        return jsonify({
+            "available": [],
+            "camera_index": load_camera_index(),
+            "active": False,
+            "backend": "",
+            "error": "Приложение еще запускается",
+        })
+
+    state = app.camera_manager.get_state()
     return jsonify({
-        "available": getattr(app, "available_cameras", []),
-        "camera_index": load_camera_index(),
-        "active": bool(getattr(app, "cap", None) and app.cap.isOpened()) if "app" in globals() else False,
-        "error": getattr(app, "camera_error", "") if "app" in globals() else "Приложение еще запускается"
+        "available": state["available"],
+        "camera_index": state["camera_index"],
+        "active": state["active"],
+        "backend": state["backend"],
+        "error": state["status"] or state["error"],
     })
 
 @app_flask.route("/api/scan_cameras", methods=["POST"])
@@ -2014,13 +2669,19 @@ def run_flask():
     app_flask.run(host="0.0.0.0", port=HOST_PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    
     print(f"\n=== ИНДУСТРИАЛЬНЫЙ КОМПЛЕКС ЗАПУЩЕН ===")
     print(f"🔗 Web-интерфейс доступен по адресу: http://localhost:{HOST_PORT}\n")
 
     root = tk.Tk()
     app = IndustrialVisionApp(root)
     globals()["app"] = app
+
+    # Flask starts after the application object exists.
+    threading.Thread(
+        target=run_flask,
+        daemon=True,
+        name="FlaskServer",
+    ).start()
+
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()

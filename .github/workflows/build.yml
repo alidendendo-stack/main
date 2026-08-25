@@ -17,11 +17,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Upgrade pip
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
 
       - name: Install dependencies
         shell: pwsh
@@ -32,20 +33,48 @@ jobs:
           pip install qdrant-client
           pip install flask
           pip install pillow
+          pip install numpy
 
-      - name: Check OpenCV
+      - name: Verify OpenCV and camera backends
         shell: pwsh
         run: |
-          python -c "import cv2; print('OpenCV:', cv2.__version__)"
-          python -c "import cv2; print('Camera backends:', cv2.videoio_registry.getCameraBackends())"
+          python -c "import cv2; print('OpenCV:', cv2.__version__); print('OpenCV path:', cv2.__file__)"
+          python -c "import cv2; ids=cv2.videoio_registry.getCameraBackends(); print('Camera backend IDs:', ids); print('Camera backends:', [cv2.videoio_registry.getBackendName(x) for x in ids])"
+          python -c "import cv2, os; p=os.path.dirname(cv2.__file__); print('OpenCV package:', p); print('VideoIO DLLs:', [x for x in os.listdir(p) if 'videoio' in x.lower() or 'msmf' in x.lower() or 'dshow' in x.lower()])"
 
-      - name: Build EXE
+      - name: Build Windows EXE
         shell: pwsh
         run: |
-          pyinstaller --onefile --noconsole --clean --name IndustrialVision --collect-all cv2 --collect-binaries cv2 --hidden-import cv2 --collect-all qdrant_client --collect-all PIL --collect-all torchvision main.py
+          pyinstaller `
+            --onefile `
+            --noconsole `
+            --clean `
+            --name IndustrialVision `
+            --collect-all cv2 `
+            --collect-all qdrant_client `
+            --collect-all PIL `
+            --collect-all torchvision `
+            --collect-all torch `
+            --hidden-import cv2 `
+            --hidden-import cv2.videoio_registry `
+            --hidden-import numpy `
+            --hidden-import PIL `
+            --hidden-import qdrant_client `
+            --hidden-import flask `
+            main.py
+
+      - name: Inspect built EXE
+        shell: pwsh
+        run: |
+          Write-Host "=== EXE INFO ==="
+          Get-Item "dist/IndustrialVision.exe" | Format-List Name,Length,FullName
+          Write-Host ""
+          Write-Host "=== DIST CONTENT ==="
+          Get-ChildItem "dist" -Recurse | Select-Object FullName,Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-exe
           path: dist/IndustrialVision.exe
+          if-no-files-found: error
